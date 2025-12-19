@@ -1,0 +1,257 @@
+H&E:
+  clustering:
+    features:
+    - area_px
+    - aspect_ratio
+    - circularity
+    - eccentricity
+    - r
+    - g
+    - b
+    - density_um2_r100.0
+    - coherency_150um
+    n_clusters: 20
+    n_neighbors: 30
+  density_radii_um:
+  - 50
+  - 100
+  - 150
+  description: Standard H&E stained tissue
+  features:
+    brown_stain: false
+    coherency: true
+    color_rgb: true
+    density: true
+    shape: true
+    variance: true
+  segmentation:
+    batch_size: 32  # A100 GPU optimized
+    channels:
+    - 0
+    - 0
+    dedup_radius_um: 5.0
+    diameter_um: 8.0
+    model: stardist
+    nms_thresh: 0.4
+    prob_thresh: 0.5
+IHC_CD3:
+  brown_detection:
+    min_area: 50
+    neighborhood_radius: 1.5
+    threshold: 0.08
+  clustering:
+    features:
+    - area_px
+    - aspect_ratio
+    - circularity
+    - brown_intensity
+    - brown_density_100um
+    - density_um2_r100.0
+    - coherency_150um
+    n_clusters: 15
+    n_neighbors: 30
+  density_radii_um:
+  - 50
+  - 100
+  - 150
+  description: CD3+ T-cell marker
+  features:
+    brown_stain: true
+    coherency: true
+    color_rgb: true
+    density: true
+    shape: true
+    variance: true
+  segmentation:
+    batch_size: 32  # A100 GPU optimized
+    channels:
+    - 0
+    - 0
+    dedup_radius_um: 5.0
+    diameter_um: 8.0
+    model: stardist
+    nms_thresh: 0.4
+    prob_thresh: 0.5
+IHC_GFAP:
+  brown_detection:
+    min_area: 60
+    neighborhood_radius: 2.0
+    threshold: 0.12
+  clustering:
+    features:
+    - area_px
+    - aspect_ratio
+    - major_axis_length
+    - brown_intensity
+    - brown_density_100um
+    - density_um2_r100.0
+    - coherency_150um
+    n_clusters: 15
+    n_neighbors: 30
+  density_radii_um:
+  - 50
+  - 100
+  - 150
+  description: GFAP+ Astrocyte marker
+  features:
+    brown_stain: true
+    coherency: true
+    color_rgb: true
+    density: true
+    shape: true
+    variance: true
+  segmentation:
+    batch_size: 32  # A100 GPU optimized
+    channels:
+    - 0
+    - 0
+    dedup_radius_um: 5.0
+    diameter_um: 9.0
+    model: stardist
+    nms_thresh: 0.4
+    prob_thresh: 0.5
+IHC_IBA1:
+  brown_detection:
+    min_area: 40
+    neighborhood_radius: 1.2
+    threshold: 0.08
+  clustering:
+    features:
+    - area_px
+    - aspect_ratio
+    - eccentricity
+    - brown_intensity
+    - brown_density_100um
+    - density_um2_r50.0
+    - coherency_150um
+    n_clusters: 15
+    n_neighbors: 25
+  density_radii_um:
+  - 50
+  - 100
+  - 150
+  description: Iba1+ Microglia marker
+  features:
+    brown_stain: true
+    coherency: true
+    color_rgb: true
+    density: true
+    shape: true
+    variance: true
+  segmentation:
+    batch_size: 32  # A100 GPU optimized
+    channels:
+    - 0
+    - 0
+    dedup_radius_um: 5.0
+    diameter_um: 8.0
+    model: stardist
+    nms_thresh: 0.3
+    prob_thresh: 0.4
+IHC_NF:
+  brown_detection:
+    min_area: 50
+    neighborhood_radius: 1.8
+    threshold: 0.2
+  clustering:
+    features:
+    - area_px
+    - aspect_ratio
+    - circularity
+    - brown_intensity
+    - brown_density_100um
+    - density_um2_r100.0
+    - coherency_150um
+    n_clusters: 15
+    n_neighbors: 30
+  density_radii_um:
+  - 50
+  - 100
+  - 150
+  description: Neurofilament marker (axons)
+  features:
+    brown_stain: true
+    coherency: true
+    color_rgb: true
+    density: true
+    shape: true
+    variance: true
+  segmentation:
+    batch_size: 32  # A100 GPU optimized
+    channels:
+    - 0
+    - 0
+    dedup_radius_um: 5.0
+    diameter_um: 8.0
+    model: stardist
+    nms_thresh: 0.4
+    prob_thresh: 0.5
+IHC_PGP95:
+  brown_detection:
+    min_area: 50
+    neighborhood_radius: 1.5
+    threshold: 0.08
+  clustering:
+    features:
+    - area_px
+    - aspect_ratio
+    - circularity
+    - brown_intensity
+    - brown_density_100um
+    - density_um2_r100.0
+    - coherency_150um
+    n_clusters: 15
+    n_neighbors: 30
+  density_radii_um:
+  - 50
+  - 100
+  - 150
+  description: PGP9.5+ Pan-neuronal marker
+  features:
+    brown_stain: true
+    coherency: true
+    color_rgb: true
+    density: true
+    shape: true
+    variance: true
+  segmentation:
+    batch_size: 32  # A100 GPU optimized
+    channels:
+    - 0
+    - 0
+    dedup_radius_um: 5.0
+    diameter_um: 8.0
+    model: stardist
+    nms_thresh: 0.4
+    prob_thresh: 0.5
+default:
+  clustering:
+    features:
+    - area_px
+    - aspect_ratio
+    - circularity
+    - density_um2_r100.0
+    n_clusters: 20
+    n_neighbors: 30
+  density_radii_um:
+  - 50
+  - 100
+  - 150
+  description: Default configuration
+  features:
+    brown_stain: false
+    coherency: true
+    color_rgb: true
+    density: true
+    shape: true
+    variance: true
+  segmentation:
+    batch_size: 32  # A100 GPU optimized
+    channels:
+    - 0
+    - 0
+    dedup_radius_um: 5.0
+    diameter_um: 8.0
+    model: stardist
+    nms_thresh: 0.4
+    prob_thresh: 0.5

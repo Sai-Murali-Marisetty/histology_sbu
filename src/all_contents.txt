@@ -1,0 +1,3443 @@
+===== 00_inspect_wsi.py =====
+# src/00_inspect_wsi.py
+
+import os
+import argparse
+import openslide
+from pathlib import Path
+
+def inspect_slide(slide_path):
+    slide = openslide.OpenSlide(str(slide_path))
+    properties = slide.properties
+    dimensions = slide.dimensions
+
+    try:
+        mpp_x = float(properties.get("openslide.mpp-x", -1))
+        mpp_y = float(properties.get("openslide.mpp-y", -1))
+        mpp = (mpp_x + mpp_y) / 2 if mpp_x > 0 and mpp_y > 0 else "Not found"
+    except:
+        mpp = "Not found"
+
+    levels = slide.level_count
+    downsample_levels = [slide.level_downsamples[i] for i in range(levels)]
+
+    return {
+        "filename": slide_path.name,
+        "width": dimensions[0],
+        "height": dimensions[1],
+        "mpp": mpp,
+        "levels": levels,
+        "downsamples": downsample_levels
+    }
+
+def main(raw_dir, out_path):
+    raw_dir = Path(raw_dir)
+    out_path = Path(out_path)
+
+    # ✅ Ensure parent directory exists
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    slides = sorted(raw_dir.glob("*.svs"))
+
+    rows = []
+    for slide_path in slides:
+        info = inspect_slide(slide_path)
+        rows.append(info)
+
+    with open(out_path, "w") as f:
+        f.write("| Slide | Width | Height | MPP (µm/px) | Levels | Downsamples |\n")
+        f.write("|-------|--------|--------|--------------|--------|-------------|\n")
+        for row in rows:
+            f.write(f"| {row['filename']} | {row['width']} | {row['height']} | {row['mpp']} | {row['levels']} | {row['downsamples']} |\n")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--raw_dir", required=True, help="Directory with raw .svs slides")
+    parser.add_argument("--out", required=True, help="Markdown output summary")
+    args = parser.parse_args()
+    main(args.raw_dir, args.out)
+
+
+
+===== 00_quick_preview_enhanced.py =====
+#!/usr/bin/env python3
+# 00_quick_preview_enhanced.py — Smart Slide Preview Generator + Panel
+
+import argparse
+from pathlib import Path
+import sys
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import cv2
+import openslide
+
+
+def add_watermark(image, text, position=(10, 10)):
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.truetype("arial.ttf", 24)
+    except Exception:
+        font = ImageFont.load_default()
+    x, y = position
+    for dx, dy in [(-1,-1),(-1,1),(1,-1),(1,1)]:
+        draw.text((x+dx, y+dy), text, font=font, fill=(0,0,0))
+    draw.text((x, y), text, font=font, fill=(255,255,255))
+    return image
+
+
+def detect_tissue_centroid(slide):
+    """Return ((cx, cy), thumb_img, tissue_mask_img, contour_list) in level-0 coords"""
+    level0_w, level0_h = slide.dimensions
+    max_dim = 1024
+    scale = max(level0_w, level0_h) / max_dim if max(level0_w, level0_h) > max_dim else 1.0
+    thumb_w = int(round(level0_w / scale))
+    thumb_h = int(round(level0_h / scale))
+    thumb = slide.get_thumbnail((thumb_w, thumb_h)).convert("RGB")
+    thumb_np = np.array(thumb)
+
+    hsv = cv2.cvtColor(thumb_np, cv2.COLOR_RGB2HSV)
+    H, S, V = cv2.split(hsv)
+    tissue = ((S > 20) & (V > 40)).astype(np.uint8) * 255
+    tissue = cv2.morphologyEx(tissue, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=2)
+
+    cnts, _ = cv2.findContours(tissue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None, thumb, Image.fromarray(tissue), []
+
+    largest = max(cnts, key=cv2.contourArea)
+    M = cv2.moments(largest)
+    if M["m00"] == 0:
+        return None, thumb, Image.fromarray(tissue), cnts
+
+    cx_thumb = int(M["m10"] / M["m00"])
+    cy_thumb = int(M["m01"] / M["m00"])
+    cx = int(round(cx_thumb * scale))
+    cy = int(round(cy_thumb * scale))
+    return (cx, cy), thumb, Image.fromarray(tissue), cnts
+
+
+def combine_panel(thumb, tissue_mask, crop, out_path):
+    thumb = thumb.resize((512, 512))
+    mask = tissue_mask.resize((512, 512))
+    crop = crop.resize((512, 512))
+
+    panel = Image.new("RGB", (3 * 512, 512))
+    panel.paste(thumb, (0, 0))
+    panel.paste(mask.convert("RGB"), (512, 0))
+    panel.paste(crop, (1024, 0))
+    panel.save(out_path, quality=95)
+    print(f"🧩 Saved preview panel: {out_path}")
+
+
+def quick_preview(slide_path, out_dir, crop_size=1024):
+    slide = openslide.OpenSlide(str(slide_path))
+    slide_id = Path(slide_path).stem
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Thumbnail
+    w0, h0 = slide.dimensions
+    max_dim = 2048
+    scale = max(w0, h0) / max_dim if max(w0, h0) > max_dim else 1.0
+    tw, th = int(round(w0 / scale)), int(round(h0 / scale))
+    thumb = slide.get_thumbnail((tw, th)).convert("RGB")
+
+    # 2. Tissue detection
+    detected, thumb, tissue_mask, contours = detect_tissue_centroid(slide)
+    thumb_np = np.array(thumb)
+    if contours:
+        cv2.drawContours(thumb_np, contours, -1, (255, 0, 0), 3)
+    thumb = Image.fromarray(thumb_np)
+    thumb = add_watermark(thumb, slide_id)
+    thumb.save(out_dir / f"{slide_id}_thumb.jpg", quality=95)
+    print(f"🖼️ Saved thumbnail: {out_dir / f'{slide_id}_thumb.jpg'}")
+
+    # 3. Tissue mask
+    tissue_mask.save(out_dir / f"{slide_id}_tissue_mask.png")
+    print(f"🧫 Saved tissue mask: {out_dir / f'{slide_id}_tissue_mask.png'}")
+
+    # 4. Crop
+    cx, cy = detected if detected else (w0 // 2, h0 // 2)
+    half = crop_size // 2
+    x0 = max(0, min(w0 - crop_size, cx - half))
+    y0 = max(0, min(h0 - crop_size, cy - half))
+
+    crop = slide.read_region((x0, y0), 0, (crop_size, crop_size)).convert("RGB")
+    crop = add_watermark(crop, slide_id)
+    crop.save(out_dir / f"{slide_id}_crop.png")
+    print(f"🧪 Saved crop: {out_dir / f'{slide_id}_crop.png'}")
+
+    # 5. Combined panel
+    combine_panel(thumb, tissue_mask, crop, out_dir / f"panel_{slide_id}_preview.png")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Generate preview images from a WSI.")
+    ap.add_argument("--raw", required=True, help="Path to slide")
+    ap.add_argument("--out_dir", required=True, help="Output folder")
+    ap.add_argument("--crop_size", type=int, default=1024)
+    args = ap.parse_args()
+    quick_preview(args.raw, args.out_dir, args.crop_size)
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== 00_to_06_batch.sh =====
+#!/bin/bash
+set -e
+
+RAW=data/raw
+RESULTS=results
+
+# Fixed parameters
+MMP=0.262697
+MASK_LEVEL=2
+DOWNSAMPLES="1.0 4.0 16.0 64.0"
+RADII="50 100"
+FEATURES="circularity gray_mean"
+CROP_SIZE=1024
+
+for SLIDE_PATH in ${RAW}/*.svs; do
+  SLIDE_FILE=$(basename "$SLIDE_PATH")
+  SLIDE="${SLIDE_FILE%.*}"
+  echo "🔁 Processing $SLIDE..."
+
+  OUT_DIR="${RESULTS}/${SLIDE}"
+  PREVIEW_DIR="${OUT_DIR}/00_preview"
+  MASK_DIR="${OUT_DIR}/01_mask"
+  TILE_DIR="${OUT_DIR}/02_tiles"
+  SEG_DIR="${OUT_DIR}/03_segment"
+  DENSITY_DIR="${OUT_DIR}/04_density"
+  FEATURES_DIR="${OUT_DIR}/05_features"
+  QC_DIR="${OUT_DIR}/06_qc"
+
+  ### Step 00 — Quick Preview
+  python3 src/00_quick_preview_enhanced.py \
+    --raw "$SLIDE_PATH" \
+    --out_dir "$PREVIEW_DIR" \
+    --crop_size "$CROP_SIZE"
+
+  ### Step 01 — Tissue Mask
+  python3 src/01_tissue_mask.py \
+      --raw "$SLIDE_PATH" \
+      --out "$MASK_DIR/tissue_mask.png" \
+      --level "$MASK_LEVEL"
+    
+
+  ### Step 02 — Tile + Stain Norm
+  python3 src/02_tile_and_stain_norm.py \
+    --input "$SLIDE_PATH" \
+    --mask "$MASK_DIR/tissue_mask.png" \
+    --out_dir "$TILE_DIR" \
+    --level "$MASK_LEVEL" \
+    --slide_id "$SLIDE"
+
+  ### Step 03 — Segment + Merge
+  python3 src/03_segment_and_merge_cellpose.py \
+    --tile_dir "$TILE_DIR" \
+    --out_dir "$SEG_DIR" \
+    --diameter 30 \
+    --mpp "$MMP" \
+    --tile_json "$TILE_DIR/tiles.json" \
+    --model "cyto2"
+
+  ### Step 04 — Density Estimation
+  python3 src/04_density.py \
+    --input_csv "$SEG_DIR/nuclei_features.csv" \
+    --output_csv "$DENSITY_DIR/nuclei_with_density.csv" \
+    --mpp "$MMP" \
+    --radii_um $RADII \
+    --tissue_mask "$MASK_DIR/tissue_mask.png" \
+    --mask_level "$MASK_LEVEL" \
+    --downsamples $DOWNSAMPLES \
+    --thumb "$PREVIEW_DIR/${SLIDE}_thumb.jpg" \
+    --summary_json "$DENSITY_DIR/density_summary.json"
+
+  ### Step 05 — Feature Enrichment + Overlays
+  python3 src/05_enrich_and_visualize_features.py \
+    --input_csv "$DENSITY_DIR/nuclei_with_density.csv" \
+    --out_csv "$FEATURES_DIR/features_enriched.csv" \
+    --out_dir "$FEATURES_DIR" \
+    --thumb "$PREVIEW_DIR/${SLIDE}_thumb.jpg" \
+    --radii_um $RADII \
+    --features $FEATURES
+
+  ### Step 06 — QC Panel + Summary
+  python3 src/06_qc_panel_and_summary.py \
+    --input_csv "$FEATURES_DIR/features_enriched.csv" \
+    --output_dir "$QC_DIR" \
+    --thumb "$PREVIEW_DIR/${SLIDE}_thumb.jpg" \
+    --scale 1.0
+
+  echo "✅ Done with $SLIDE"
+done
+
+echo "🎉 ALL SLIDES COMPLETED!"
+
+
+
+===== 01_tissue_mask.py =====
+#!/usr/bin/env python3
+# 01_tissue_mask.py — Improved Tissue Detection Mask Generator
+import argparse
+from pathlib import Path
+import numpy as np
+from PIL import Image
+import cv2
+import sys
+
+try:
+    import openslide
+except Exception:
+    sys.stderr.write(
+        "ERROR: openslide-python is required. Install it via pip and ensure OpenSlide libs are installed.\n"
+    )
+    raise
+
+
+def generate_tissue_mask(slide_path: str, out_path: str, level: int = 2):
+    slide = openslide.OpenSlide(slide_path)
+    if level >= slide.level_count:
+        raise ValueError(f"Slide has only {slide.level_count} levels; got level={level}.")
+
+    w, h = slide.level_dimensions[level]
+    img = slide.read_region((0, 0), level, (w, h)).convert("RGB")
+    img_np = np.array(img)
+
+    # --- HSV threshold (looser to include more tissue) ---
+    hsv = cv2.cvtColor(img_np, cv2.COLOR_RGB2HSV)
+    H, S, V = cv2.split(hsv)
+    mask = ((S > 10) & (V > 20)).astype(np.uint8) * 255
+
+    # --- Morphological cleanup ---
+    # Close gaps inside tissue
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8), iterations=2)
+    # Remove small specks
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+
+    # --- Keep only largest connected component (main tissue) ---
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels > 1:
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])  # skip background
+        mask = np.where(labels == largest, 255, 0).astype(np.uint8)
+
+    # --- Save result ---
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(mask).save(out_path)
+    print(f"✅ Saved tissue mask at level {level}: {out_path}  (size={w}×{h})")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Generate a binary tissue mask from a WSI using HSV thresholds and morphology.")
+    ap.add_argument("--raw", required=True, help="Path to .svs slide")
+    ap.add_argument("--out", required=True, help="Output path for mask (.png/.tif)")
+    ap.add_argument("--level", type=int, default=2, help="OpenSlide level to use (default 2)")
+    ap.add_argument("--overwrite", action="store_true", help="Overwrite out file if it exists")
+    args = ap.parse_args()
+
+    if Path(args.out).exists() and not args.overwrite:
+        print(f"⚠️ Output exists, skipping (use --overwrite to force): {args.out}")
+        return
+    generate_tissue_mask(args.raw, args.out, level=args.level)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== 02_tile_and_stain_norm.py =====
+# src/02_tile_and_stain_norm.py
+
+import os
+import argparse
+import json
+import openslide
+import numpy as np
+from PIL import Image
+import cv2
+from pathlib import Path
+from tqdm import tqdm
+
+
+def extract_tiles(slide_path, mask_path, out_dir, tile_size=1024, overlap=128, level=0):
+    slide = openslide.OpenSlide(slide_path)
+
+    # Load tissue mask and get its dimensions
+    tissue_mask_img = Image.open(mask_path).convert("L")
+    tissue_mask = np.array(tissue_mask_img) > 0
+    mask_h, mask_w = tissue_mask.shape
+
+    # Get slide dimensions at specified level
+    slide_w, slide_h = slide.level_dimensions[level]
+    
+    # CRITICAL FIX: Get the correct downsample factor for this level
+    downsample = slide.level_downsamples[level]
+
+    # Scale between slide coordinates at level 0 and tissue mask
+    # Mask is created from a downsampled level, need to map correctly
+    scale_x = mask_w / slide.level_dimensions[0][0]
+    scale_y = mask_h / slide.level_dimensions[0][1]
+
+    step = tile_size - overlap
+    tiles = []
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    tile_count = 0
+    skipped = 0
+
+    print(f"Slide dimensions at level {level}: {slide_w} x {slide_h}")
+    print(f"Downsample factor: {downsample}")
+    print(f"Tissue mask size: {mask_w} x {mask_h}")
+    print(f"Tile size: {tile_size}, Overlap: {overlap}, Step: {step}")
+
+    for y in tqdm(range(0, slide_h - tile_size + 1, step), desc="Tiling"):
+        for x in range(0, slide_w - tile_size + 1, step):
+            # CRITICAL FIX: Map tile coordinates to level 0 coordinates
+            # Tiles are in level coordinates, need to convert to level 0 for mask mapping
+            x_lvl0 = int(x * downsample)
+            y_lvl0 = int(y * downsample)
+
+            # Map level-0 coordinates to tissue mask coordinates
+            x_mask = int(x_lvl0 * scale_x)
+            y_mask = int(y_lvl0 * scale_y)
+            
+            # Size of tile in mask coordinates
+            mask_tile_size = int(tile_size * downsample * scale_x)
+
+            # Crop mask area and check if it's mostly tissue
+            mask_crop = tissue_mask[
+                y_mask:y_mask + mask_tile_size,
+                x_mask:x_mask + mask_tile_size
+            ]
+
+            # Skip if mask crop is too small (edge of image)
+            if mask_crop.shape[0] < mask_tile_size * 0.5 or mask_crop.shape[1] < mask_tile_size * 0.5:
+                skipped += 1
+                continue
+
+            # Skip if less than 50% tissue
+            if np.mean(mask_crop) < 0.5:
+                skipped += 1
+                continue
+
+            # Read tile from WSI at target level
+            # Note: read_region uses level-0 coordinates even when reading at other levels
+            tile_img = slide.read_region((x_lvl0, y_lvl0), level, (tile_size, tile_size)).convert("RGB")
+            
+            tile_fname = out_dir / f"tile_{x}_{y}.png"
+            tile_img.save(tile_fname)
+
+            tiles.append({
+                "x": x, 
+                "y": y, 
+                "w": tile_size, 
+                "h": tile_size,
+                "level": level,
+                "x_lvl0": x_lvl0,
+                "y_lvl0": y_lvl0
+            })
+            tile_count += 1
+
+    # Save tile metadata
+    metadata = {
+        "tiles": tiles,
+        "level": level,
+        "downsample": float(downsample),
+        "level_dimensions": list(slide.level_dimensions[level]),
+        "tile_size": tile_size,
+        "overlap": overlap,
+        "level_mpp": float(slide.properties.get("openslide.mpp-x", -1))
+    }
+    
+    with open(out_dir / "tiles.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"\nDone: {tile_count} tiles saved | {skipped} skipped (background or edge)")
+    print(f"Output dir: {out_dir}")
+    print(f"Metadata saved: {out_dir / 'tiles.json'}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Extract tiles from WSI using tissue mask with coordinate mapping fix"
+    )
+    parser.add_argument("--raw", required=True, help="Path to .svs slide")
+    parser.add_argument("--tissue_mask", required=True, help="Path to tissue mask")
+    parser.add_argument("--out_dir", required=True, help="Output tile directory")
+    parser.add_argument("--tile_size", type=int, default=1024, help="Tile size in pixels")
+    parser.add_argument("--overlap", type=int, default=128, help="Overlap between tiles")
+    parser.add_argument("--level", type=int, default=0, help="OpenSlide level for tiling (default=0)")
+    args = parser.parse_args()
+
+    extract_tiles(args.raw, args.tissue_mask, args.out_dir, 
+                  args.tile_size, args.overlap, args.level)
+
+
+
+===== 03_segment_and_merge_cellpose.py =====
+import os
+import json
+import argparse
+import hashlib
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+
+from cellpose.models import CellposeModel
+from skimage.measure import regionprops
+from scipy.spatial import cKDTree
+
+import matplotlib.pyplot as plt
+from matplotlib import cm
+
+
+def _ensure_uint16(arr):
+    if arr.dtype != np.uint16:
+        if arr.max() > np.iinfo(np.uint16).max:
+            raise ValueError("Label IDs exceed uint16 range.")
+        return arr.astype(np.uint16)
+    return arr
+
+
+def _props_from_labelmask(label_img):
+            for p in regionprops(label_img):
+                yield {
+                    "label": int(p.label),
+                    "cy": float(p.centroid[0]),
+                    "cx": float(p.centroid[1]),
+                    "area_px": float(p.area),
+                    "perimeter_px": float(getattr(p, "perimeter", 0.0)),
+                    "eccentricity": float(getattr(p, "eccentricity", 0.0)),
+                    "solidity": float(getattr(p, "solidity", 0.0)),
+                    "major_axis_length": float(getattr(p, "major_axis_length", 0.0)),
+                    "minor_axis_length": float(getattr(p, "minor_axis_length", 0.0)),
+                    "orientation": float(getattr(p, "orientation", 0.0)),  # ADD THIS LINE
+                }
+
+
+def stable_id(slide, x_um, y_um, ndigits=1):
+    key = f"{slide}:{round(x_um, ndigits)}:{round(y_um, ndigits)}"
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
+
+
+def dedup_by_radius(df, radius_um, prefer_col="area_px"):
+    sort_idx = np.argsort(df[prefer_col].to_numpy(np.float64))[::-1]
+    dfs = df.iloc[sort_idx].reset_index(drop=False).rename(columns={"index": "_orig_idx"})
+
+    coords = dfs[["x_um", "y_um"]].to_numpy(np.float32)
+    tree = cKDTree(coords)
+    keep = np.ones(len(dfs), dtype=bool)
+
+    for i in range(len(dfs)):
+        if not keep[i]:
+            continue
+        nbrs = tree.query_ball_point(coords[i], r=radius_um)
+        for j in nbrs:
+            if j == i:
+                continue
+            keep[j] = False
+
+    kept = dfs.loc[keep].copy()
+    kept = kept.sort_values("_orig_idx").drop(columns=["_orig_idx"]).reset_index(drop=True)
+    return kept
+
+
+def process_batch(model, batch_imgs, batch_infos, diam_px, masks_dir, tiles_dir, viz_dir):
+    masks_out, *_ = model.eval(
+        batch_imgs,
+        diameter=diam_px,
+        channels=[0, 0],
+        batch_size=len(batch_imgs)
+    )
+
+    if isinstance(masks_out, np.ndarray):
+        masks_out = [masks_out] if masks_out.ndim == 2 else list(masks_out)
+
+    rows = []
+    for (x, y, tile_name), label_img in zip(batch_infos, masks_out):
+        if label_img is None or label_img.max() == 0:
+            continue
+
+        # === Save 16-bit mask ===
+        mask_path = os.path.join(masks_dir, f"mask_{x}_{y}.png")
+        Image.fromarray(_ensure_uint16(label_img), mode="I;16").save(mask_path)
+
+        # === Save overlay JPEG ===
+        try:
+            tile_path = os.path.join(tiles_dir, tile_name)
+            tile_img = np.array(Image.open(tile_path).convert("RGB"))
+
+            label_overlay = cm.nipy_spectral(label_img / (label_img.max() + 1e-5))[:, :, :3]
+            label_overlay = (label_overlay * 255).astype(np.uint8)
+
+            overlay = (0.6 * tile_img + 0.4 * label_overlay).astype(np.uint8)
+
+            viz_path = os.path.join(viz_dir, f"preview_{x}_{y}.jpg")
+            Image.fromarray(overlay).save(viz_path)
+        except Exception as e:
+            print(f"⚠️ Could not save overlay for {tile_name}: {e}")
+            tile_img = None  # fallback: no color features
+
+        # === Extract features ===
+        if tile_img is None:
+            continue
+
+        for P in _props_from_labelmask(label_img):
+            major = P["major_axis_length"]
+            minor = P["minor_axis_length"]
+            aspect = (major / minor) if minor > 0 else 0.0
+
+            # Extract RGB mean intensities
+            mask = (label_img == P["label"])
+            if mask.sum() > 0:
+                r_mean = float(tile_img[:, :, 0][mask].mean())
+                g_mean = float(tile_img[:, :, 1][mask].mean())
+                b_mean = float(tile_img[:, :, 2][mask].mean())
+            else:
+                r_mean = g_mean = b_mean = 0.0
+
+            rows.append({
+                "x": x + P["cx"],
+                "y": y + P["cy"],
+                "area_px": P["area_px"],
+                "perimeter_px": P["perimeter_px"],
+                "eccentricity": P["eccentricity"],
+                "solidity": P["solidity"],
+                "major_axis_length": major,
+                "minor_axis_length": minor,
+                "aspect_ratio": aspect,
+                "orientation": P["orientation"],  # ADD THIS LINE
+                "r": r_mean,
+                "g": g_mean,
+                "b": b_mean,
+                "tile_x": x,
+                "tile_y": y,
+                "tile_id": f"{x}_{y}",
+                "tile": tile_name,
+                "label": P["label"],
+            })
+    return rows
+
+
+def make_qc_panel(viz_dir, out_path, max_images=5):
+    previews = sorted(Path(viz_dir).glob("preview_*.jpg"))
+    if not previews:
+        print("⚠️ No overlay previews found.")
+        return
+    images = [Image.open(p) for p in previews[:max_images]]
+    widths, heights = zip(*(img.size for img in images))
+    panel = Image.new("RGB", (sum(widths), max(heights)))
+    x_offset = 0
+    for img in images:
+        panel.paste(img, (x_offset, 0))
+        x_offset += img.width
+    panel.save(out_path)
+    print(f"🖼️ QC panel saved: {out_path}")
+
+
+def segment_and_merge(tiles_dir, tiles_json, masks_dir, out_csv,
+                      slide_id, mpp, diam_um, batch_size, gpu, dedup_radius_um):
+
+    with open(tiles_json, "r") as f:
+        meta = json.load(f)
+    tiles = meta["tiles"]
+    print(f"📦 Loaded {len(tiles)} tiles from {tiles_json}")
+
+    Path(masks_dir).mkdir(parents=True, exist_ok=True)
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    viz_dir = Path(masks_dir).parent / "viz"
+    viz_dir.mkdir(parents=True, exist_ok=True)
+
+    diam_px = float(diam_um) / float(mpp)
+    print(f"📏 Cell diameter: {diam_um} µm → {diam_px:.1f} px at {mpp:.4f} µm/px")
+
+    model = CellposeModel(gpu=gpu, pretrained_model="cyto2")
+    print(f"🧠 Cellpose model loaded (GPU={gpu}, model=cyto2)")
+
+    all_rows = []
+    batch_imgs, batch_infos = [], []
+
+    for t in tqdm(tiles, desc="🔍 Segmenting tiles"):
+        x, y, w, h = t["x"], t["y"], t["w"], t["h"]
+        tile_name = f"tile_{x}_{y}.png"
+        tile_path = os.path.join(tiles_dir, tile_name)
+        if not os.path.exists(tile_path):
+            print(f"⚠️ Missing tile: {tile_name}")
+            continue
+
+        img = np.array(Image.open(tile_path).convert("RGB"))
+        batch_imgs.append(img)
+        batch_infos.append((x, y, tile_name))
+
+        if len(batch_imgs) >= batch_size:
+            rows = process_batch(model, batch_imgs, batch_infos, diam_px, masks_dir, tiles_dir, viz_dir)
+            all_rows.extend(rows)
+            batch_imgs, batch_infos = [], []
+
+    if batch_imgs:
+        rows = process_batch(model, batch_imgs, batch_infos, diam_px, masks_dir, tiles_dir, viz_dir)
+        all_rows.extend(rows)
+
+    df = pd.DataFrame(all_rows)
+    print(f"🔬 Nuclei before dedup: {len(df):,}")
+
+    df["x_um"] = df["x"] * mpp
+    df["y_um"] = df["y"] * mpp
+
+    df = dedup_by_radius(df, dedup_radius_um)
+    print(f"✅ After deduplication: {len(df):,} nuclei (radius={dedup_radius_um} µm)")
+
+    df["slide_id"] = slide_id
+    df["nucleus_id"] = [
+        stable_id(slide_id, x, y) for x, y in zip(df["x_um"], df["y_um"])
+    ]
+
+    key_cols = ["slide_id", "nucleus_id", "x", "y", "x_um", "y_um", "area_px"]
+    df = df[key_cols + [c for c in df.columns if c not in key_cols]]
+
+    df.to_csv(out_csv, index=False)
+    print(f"📄 Saved features CSV: {out_csv}")
+
+    # Generate QC panel
+    make_qc_panel(viz_dir, Path(masks_dir).parent / f"qc_panel.jpg")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tiles_dir", required=True)
+    ap.add_argument("--tiles_json", required=True)
+    ap.add_argument("--masks_dir", required=True)
+    ap.add_argument("--out_csv", required=True)
+    ap.add_argument("--slide_id", required=True)
+    ap.add_argument("--mpp", type=float, required=True)
+    ap.add_argument("--diam_um", type=float, default=10.0)
+    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--gpu", action="store_true")
+    ap.add_argument("--dedup_radius_um", type=float, default=6.0)
+    args = ap.parse_args()
+
+    segment_and_merge(
+        tiles_dir=args.tiles_dir,
+        tiles_json=args.tiles_json,
+        masks_dir=args.masks_dir,
+        out_csv=args.out_csv,
+        slide_id=args.slide_id,
+        mpp=args.mpp,
+        diam_um=args.diam_um,
+        batch_size=args.batch_size,
+        gpu=args.gpu,
+        dedup_radius_um=args.dedup_radius_um
+    )
+
+
+
+===== 03_segment_and_merge_stardist.py =====
+# src/03_segment_and_merge_stardist.py
+import os, json, argparse, hashlib
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+
+from stardist.models import StarDist2D
+from csbdeep.utils import normalize
+from skimage.measure import regionprops
+from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+
+def _ensure_uint16(arr):
+    if arr.dtype != np.uint16:
+        if arr.max() > np.iinfo(np.uint16).max:
+            raise ValueError("Label IDs exceed uint16 range.")
+        return arr.astype(np.uint16)
+    return arr
+
+def _props_from_labelmask(label_img):
+    for p in regionprops(label_img):
+        yield {
+            "label": int(p.label),
+            "cy": float(p.centroid[0]),
+            "cx": float(p.centroid[1]),
+            "area_px": float(p.area),
+            "perimeter_px": float(getattr(p, "perimeter", 0.0)),
+            "eccentricity": float(getattr(p, "eccentricity", 0.0)),
+            "solidity": float(getattr(p, "solidity", 0.0)),
+            "major_axis_length": float(getattr(p, "major_axis_length", 0.0)),
+            "minor_axis_length": float(getattr(p, "minor_axis_length", 0.0)),
+        }
+
+def stable_id(slide, x_um, y_um, ndigits=1):
+    key = f"{slide}:{round(x_um, ndigits)}:{round(y_um, ndigits)}"
+    return hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
+
+def dedup_by_radius(df, radius_um, prefer_col="area_px"):
+    sort_idx = np.argsort(df[prefer_col].to_numpy(np.float64))[::-1]
+    dfs = df.iloc[sort_idx].reset_index(drop=True)
+    coords = dfs[["x_um", "y_um"]].to_numpy(np.float32)
+    tree = cKDTree(coords)
+    keep = np.ones(len(dfs), dtype=bool)
+    for i in range(len(dfs)):
+        if not keep[i]: continue
+        for j in tree.query_ball_point(coords[i], r=radius_um):
+            if j != i: keep[j] = False
+    return dfs.loc[keep].reset_index(drop=True)
+
+def process_batch(model, batch_imgs, batch_infos, diam_px, masks_dir, tiles_dir, viz_dir, prob_thresh, nms_thresh):
+    import cv2
+    rows = []
+    for (x, y, tile_name), img in zip(batch_infos, batch_imgs):
+        img_rgb = np.asarray(img)
+        img_gray = np.dot(img_rgb[...,:3], [0.2989, 0.5870, 0.1140]).astype(np.float32)
+        img_norm = normalize(img_gray, 1, 99.8)
+
+        labels, _ = model.predict_instances(img_norm, prob_thresh=prob_thresh, nms_thresh=nms_thresh)
+        if labels is None or labels.max() == 0: 
+            continue
+        label_img = _ensure_uint16(labels)
+
+        # save mask
+        Image.fromarray(label_img).save(os.path.join(masks_dir, f"mask_{x}_{y}.png"))
+
+        # overlay preview
+        preview = img_rgb.copy()
+        contours, _ = cv2.findContours((label_img > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(preview, contours, -1, (255, 0, 0), 2)
+        Image.fromarray(preview).save(os.path.join(viz_dir, f"preview_{x}_{y}.jpg"))
+
+        for P in _props_from_labelmask(label_img):
+            lbl = P["label"]
+            m = (label_img == lbl)
+            r = float(img_rgb[...,0][m].mean()) if m.any() else 0.0
+            g = float(img_rgb[...,1][m].mean()) if m.any() else 0.0
+            b = float(img_rgb[...,2][m].mean()) if m.any() else 0.0
+            major = P["major_axis_length"]; minor = P["minor_axis_length"]
+            aspect = float(major/minor) if minor > 0 else 0.0
+            rows.append({
+                "tile": tile_name, "tile_x": x, "tile_y": y, "label": lbl,
+                "cx": P["cx"], "cy": P["cy"], "x_px": P["cx"], "y_px": P["cy"],
+                "area_px": P["area_px"], "perimeter_px": P["perimeter_px"],
+                "eccentricity": P["eccentricity"], "solidity": P["solidity"],
+                "major_axis_length": major, "minor_axis_length": minor, "aspect_ratio": aspect,
+                "r": r, "g": g, "b": b, "tile_id": f"{x}_{y}",
+            })
+    return rows
+
+def make_qc_panel(viz_dir, out_path, max_images=5):
+    previews = sorted(Path(viz_dir).glob("preview_*.jpg"))
+    if not previews:
+        print("⚠️ No overlay previews found."); return
+    images = [Image.open(p) for p in previews[:max_images]]
+    widths, heights = zip(*(img.size for img in images))
+    panel = Image.new("RGB", (sum(widths), max(heights)))
+    x_offset = 0
+    for img in images:
+        panel.paste(img, (x_offset, 0)); x_offset += img.width
+    panel.save(out_path); print(f"🖼️ QC panel saved: {out_path}")
+
+def segment_and_merge(tiles_dir, tiles_json, masks_dir, out_csv,
+                      slide_id, mpp, diam_um, batch_size, gpu, dedup_radius_um,
+                      stardist_model, prob_thresh, nms_thresh):
+    with open(tiles_json, "r") as f: meta = json.load(f)
+    tiles = meta["tiles"]; print(f"📦 Loaded {len(tiles)} tiles from {tiles_json}")
+
+    Path(masks_dir).mkdir(parents=True, exist_ok=True)
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    viz_dir = Path(masks_dir).parent / "viz"; viz_dir.mkdir(parents=True, exist_ok=True)
+
+    # choose model
+    if stardist_model.lower() in {"2d_versatile_he", "versatile_he"}:
+        model = StarDist2D.from_pretrained("2D_versatile_he")
+    elif stardist_model.lower() in {"2d_versatile_fluo", "versatile_fluo"}:
+        model = StarDist2D.from_pretrained("2D_versatile_fluo")
+    else:
+        model = StarDist2D(None, name=Path(stardist_model).name, basedir=str(Path(stardist_model).parent))
+
+    diam_px = float(diam_um) / float(mpp)
+    print(f"📏 Target nucleus diameter: {diam_um} µm → ~{diam_px:.1f} px at {mpp:.4f} µm/px (StarDist ignores diameter)")
+
+    all_rows, batch_imgs, batch_infos = [], [], []
+    for t in tqdm(tiles, desc="Segmenting (StarDist)"):
+        x, y = t["x"], t["y"]
+        tile_name = f"tile_{x}_{y}.png"
+        tile_path = os.path.join(tiles_dir, tile_name)
+        if not os.path.exists(tile_path):
+            print(f"⚠️ Missing tile: {tile_name}"); continue
+        img = Image.open(tile_path).convert("RGB")
+        batch_imgs.append(img); batch_infos.append((x, y, tile_name))
+        if len(batch_imgs) >= batch_size:
+            all_rows += process_batch(model, batch_imgs, batch_infos, diam_px, masks_dir, tiles_dir, viz_dir, prob_thresh, nms_thresh)
+            batch_imgs, batch_infos = [], []
+    if batch_imgs:
+        all_rows += process_batch(model, batch_imgs, batch_infos, diam_px, masks_dir, tiles_dir, viz_dir, prob_thresh, nms_thresh)
+
+    if not all_rows:
+        print("⚠️ No nuclei detected."); pd.DataFrame(columns=["slide_id","nucleus_id"]).to_csv(out_csv, index=False); return
+
+    df = pd.DataFrame(all_rows)
+
+    # map to absolute coords
+    tile_size = meta.get("tile_size", 1024)
+    abs_x_px, abs_y_px = [], []
+    for _, row in df.iterrows():
+        tx, ty = map(int, row["tile_id"].split("_"))
+        # try explicit origins if present, else tile grid * tile_size
+        ox = next((tt.get("x0_px", tt.get("x0", tx*tile_size)) for tt in tiles if tt["x"]==tx and tt["y"]==ty), tx*tile_size)
+        oy = next((tt.get("y0_px", tt.get("y0", ty*tile_size)) for tt in tiles if tt["x"]==tx and tt["y"]==ty), ty*tile_size)
+        abs_x_px.append(ox + row["x_px"]); abs_y_px.append(oy + row["y_px"])
+    df["x"] = np.array(abs_x_px, dtype=np.float32)
+    df["y"] = np.array(abs_y_px, dtype=np.float32)
+    df["x_um"] = df["x"] * float(mpp); df["y_um"] = df["y"] * float(mpp)
+
+    before = len(df)
+    df = dedup_by_radius(df, radius_um=dedup_radius_um, prefer_col="area_px")
+    print(f"✅ After deduplication: {len(df):,} nuclei (from {before:,}; radius={dedup_radius_um} µm)")
+
+    df["slide_id"] = slide_id
+    df["nucleus_id"] = [stable_id(slide_id, x, y) for x, y in zip(df["x_um"], df["y_um"])]
+    key_cols = ["slide_id", "nucleus_id", "x", "y", "x_um", "y_um", "area_px"]
+    df = df[key_cols + [c for c in df.columns if c not in key_cols]]
+    df.to_csv(out_csv, index=False); print(f"📄 Saved features CSV: {out_csv}")
+
+    make_qc_panel(viz_dir, Path(masks_dir).parent / f"qc_panel.jpg")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tiles_dir", required=True)
+    ap.add_argument("--tiles_json", required=True)
+    ap.add_argument("--masks_dir", required=True)
+    ap.add_argument("--out_csv", required=True)
+    ap.add_argument("--slide_id", required=True)
+    ap.add_argument("--mpp", type=float, required=True)
+    ap.add_argument("--diam_um", type=float, default=10.0)
+    ap.add_argument("--batch_size", type=int, default=4)
+    ap.add_argument("--gpu", action="store_true", help="(unused; TF handles this)")
+    ap.add_argument("--dedup_radius_um", type=float, default=6.0)
+    ap.add_argument("--stardist_model", default="2D_versatile_he", help='{"2D_versatile_he","2D_versatile_fluo"} or path to custom model dir')
+    ap.add_argument("--prob_thresh", type=float, default=0.5)
+    ap.add_argument("--nms_thresh", type=float, default=0.4)
+    args = ap.parse_args()
+
+    segment_and_merge(
+        tiles_dir=args.tiles_dir, tiles_json=args.tiles_json, masks_dir=args.masks_dir, out_csv=args.out_csv,
+        slide_id=args.slide_id, mpp=args.mpp, diam_um=args.diam_um, batch_size=args.batch_size, gpu=args.gpu,
+        dedup_radius_um=args.dedup_radius_um, stardist_model=args.stardist_model,
+        prob_thresh=args.prob_thresh, nms_thresh=args.nms_thresh
+    )
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== 04_density.py =====
+import argparse
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from skimage.io import imread
+from PIL import Image
+import matplotlib.pyplot as plt
+import json
+import gc
+
+
+def compute_density(x_um, y_um, radii_um):
+    from scipy.spatial import cKDTree
+
+    coords = np.vstack([x_um, y_um]).T
+    tree = cKDTree(coords)
+
+    density_dict = {}
+    for r in radii_um:
+        r_sq = np.pi * (r ** 2)
+        counts = np.array([len(tree.query_ball_point(p, r)) - 1 for p in coords])
+        density = counts / r_sq  # per µm²
+        density_dict[f"density_um2_r{r}"] = density
+    return density_dict
+
+
+def mask_correction(x_px, y_px, mask_img, radius_px):
+    mask = mask_img > 0
+    h, w = mask.shape
+    mask_area = np.zeros(len(x_px))
+
+    for i, (x, y) in enumerate(zip(x_px, y_px)):
+        x, y = int(round(x)), int(round(y))
+        x0 = max(x - radius_px, 0)
+        x1 = min(x + radius_px, w)
+        y0 = max(y - radius_px, 0)
+        y1 = min(y + radius_px, h)
+
+        roi = mask[y0:y1, x0:x1]
+        mask_area[i] = roi.sum()
+    return mask_area
+
+
+def scatter_overlay(x, y, vals, thumb_path, out_path, title="", vmin=None, vmax=None):
+    if not Path(thumb_path).exists():
+        print(f"⚠️ Thumbnail not found: {thumb_path}")
+        return
+
+    img = np.array(Image.open(thumb_path).convert("RGB"))
+    fig, ax = plt.subplots(figsize=(12, 12))
+    ax.imshow(img)
+
+    vmin = vmin or np.percentile(vals, 2)
+    vmax = vmax or np.percentile(vals, 98)
+
+    sc = ax.scatter(x, y, c=vals, cmap="plasma", s=10, edgecolor="none", vmin=vmin, vmax=vmax)
+    ax.axis("off")
+    plt.title(title, fontsize=14)
+    plt.colorbar(sc, shrink=0.5)
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"🖼️ Saved: {out_path}")
+
+
+def scatter_panel(images, out_path):
+    if not images:
+        return
+    loaded = [Image.open(img) for img in images if Path(img).exists()]
+    if not loaded:
+        return
+
+    widths, heights = zip(*(img.size for img in loaded))
+    panel = Image.new("RGB", (sum(widths), max(heights)))
+    x_offset = 0
+    for img in loaded:
+        panel.paste(img, (x_offset, 0))
+        x_offset += img.size[0]
+
+    panel.save(out_path)
+    print(f"📊 QC panel saved: {out_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input_csv", required=True)
+    ap.add_argument("--output_csv", required=True)
+    ap.add_argument("--mpp", type=float, required=True)
+    ap.add_argument("--radii_um", nargs="+", type=float, default=[50, 100])
+    ap.add_argument("--tissue_mask", required=True)
+    ap.add_argument("--mask_level", type=int, default=2)
+    ap.add_argument("--downsamples", nargs="+", type=float, required=True)
+    ap.add_argument("--thumb", required=True)
+    ap.add_argument("--summary_json", required=True)
+    ap.add_argument("--percentile_clip", nargs=2, type=float, default=[2, 98])
+    args = ap.parse_args()
+
+    # === Load data
+    df = pd.read_csv(args.input_csv)
+    x_um = df["x_um"].to_numpy()
+    y_um = df["y_um"].to_numpy()
+
+    # === Compute densities
+    print("📈 Computing densities...")
+    density_dict = compute_density(x_um, y_um, args.radii_um)
+    for k, v in density_dict.items():
+        df[k] = v
+
+    # === Load tissue mask
+    print("🧬 Loading tissue mask...")
+    mask_img = imread(args.tissue_mask)
+    down = args.downsamples[args.mask_level]
+    x_px = (df["x"] / down).to_numpy()
+    y_px = (df["y"] / down).to_numpy()
+
+    # === Apply tissue correction
+    for r in args.radii_um:
+        r_px = r / (args.mpp * down)
+        mask_area = mask_correction(x_px, y_px, mask_img, radius_px=int(round(r_px)))
+        key = f"corrected_density_um2_r{r}"
+        df[key] = df[f"density_um2_r{r}"] * (np.pi * r_px ** 2) / np.maximum(mask_area, 1e-6)
+
+    # === Save enriched CSV
+    Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(args.output_csv, index=False)
+    print(f"💾 Saved: {args.output_csv}")
+
+    # === Save visual overlays
+    base_dir = Path(args.output_csv).parent
+    preview_images = []
+    for r in args.radii_um:
+        col = f"corrected_density_um2_r{r}"
+        out_img = base_dir / f"density_overlay_r{r}.jpg"
+        scatter_overlay(
+            df["x"], df["y"], df[col],
+            thumb_path=args.thumb,
+            out_path=out_img,
+            title=f"Corrected Density r={r} µm",
+            vmin=np.percentile(df[col], args.percentile_clip[0]),
+            vmax=np.percentile(df[col], args.percentile_clip[1])
+        )
+        preview_images.append(out_img)
+
+    # === QC Panel
+    scatter_panel(preview_images, base_dir / f"panel_density_{Path(args.input_csv).stem}.jpg")
+
+    # === Summary JSON
+    summary = {
+        "total_cells": int(len(df)),
+        "mean_x": float(df["x_um"].mean()),
+        "mean_y": float(df["y_um"].mean()),
+        "radii_um": args.radii_um
+    }
+    for r in args.radii_um:
+        key = f"corrected_density_um2_r{r}"
+        vals = df[key]
+        summary[f"{key}_P10"] = float(np.percentile(vals, 10))
+        summary[f"{key}_median"] = float(np.percentile(vals, 50))
+        summary[f"{key}_P90"] = float(np.percentile(vals, 90))
+
+    Path(args.summary_json).parent.mkdir(parents=True, exist_ok=True)
+    with open(args.summary_json, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"📄 Saved summary: {args.summary_json}")
+
+    # === Cleanup
+    del df
+    gc.collect()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== 05_enrich_and_visualize_features.py =====
+import argparse
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import os
+from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+from PIL import Image
+
+
+def compute_coherency(df, radius_um):
+    """
+    Compute coherency (nuclear alignment) in local neighborhoods.
+    
+    Coherency measures how aligned nuclear orientations are:
+    - 0 = random orientations
+    - 1 = perfectly aligned
+    
+    Uses structure tensor approach similar to OrientationJ.
+    """
+    coords = np.vstack([df["x_um"], df["y_um"]]).T
+    tree = cKDTree(coords)
+    
+    # Calculate orientation angle from major/minor axis
+    # Angle of major axis relative to horizontal
+    # angles = np.arctan2(df["minor_axis_length"], df["major_axis_length"])
+    angles = df['orientation']
+    
+    coherency = []
+    for i, p in enumerate(coords):
+        idx = tree.query_ball_point(p, radius_um)
+        
+        if len(idx) < 3:  # Need minimum neighbors for meaningful coherency
+            coherency.append(0.0)
+            continue
+        
+        # Get local orientations
+        local_angles = angles.iloc[idx].values if hasattr(angles, 'iloc') else angles[idx]
+        
+        # Compute structure tensor components
+        Jxx = np.mean(np.cos(local_angles)**2)
+        Jyy = np.mean(np.sin(local_angles)**2)
+        Jxy = np.mean(np.cos(local_angles) * np.sin(local_angles))
+        
+        # Coherency from eigenvalues of structure tensor
+        trace = Jxx + Jyy
+        det = Jxx * Jyy - Jxy**2
+        
+        # Avoid numerical errors
+        discriminant = trace**2 - 4*det
+        if discriminant < 0:
+            discriminant = 0
+        
+        lambda1 = 0.5 * (trace + np.sqrt(discriminant))
+        lambda2 = 0.5 * (trace - np.sqrt(discriminant))
+        
+        if lambda1 + lambda2 > 1e-10:
+            coh = (lambda1 - lambda2) / (lambda1 + lambda2)
+        else:
+            coh = 0.0
+        
+        coherency.append(coh)
+    
+    return np.array(coherency)
+
+
+def compute_local_stats(df, feature, radius_um):
+    """
+    Compute mean, variance, and coefficient of variation for local neighborhoods.
+    
+    Returns:
+        local_mean: average value in neighborhood
+        local_var: variance in neighborhood
+        local_cv: coefficient of variation (std/mean)
+    """
+    coords = np.vstack([df["x_um"], df["y_um"]]).T
+    tree = cKDTree(coords)
+    values = df[feature].to_numpy()
+    
+    local_mean = []
+    local_var = []
+    local_cv = []
+    
+    for i, p in enumerate(coords):
+        idx = tree.query_ball_point(p, radius_um)
+        local_vals = values[idx]
+        
+        if len(local_vals) == 0:
+            local_mean.append(values[i])
+            local_var.append(0.0)
+            local_cv.append(0.0)
+            continue
+        
+        mean_val = np.mean(local_vals)
+        var_val = np.var(local_vals)
+        std_val = np.std(local_vals)
+        cv_val = std_val / mean_val if mean_val > 1e-10 else 0.0
+        
+        local_mean.append(mean_val)
+        local_var.append(var_val)
+        local_cv.append(cv_val)
+    
+    return np.array(local_mean), np.array(local_var), np.array(local_cv)
+
+
+def compute_local_feature(df, feature, radius_um):
+    """Original function - kept for backward compatibility"""
+    coords = np.vstack([df["x_um"], df["y_um"]]).T
+    tree = cKDTree(coords)
+    values = df[feature].to_numpy()
+    smoothed = []
+    for i, p in enumerate(coords):
+        idx = tree.query_ball_point(p, radius_um)
+        local_vals = values[idx]
+        smoothed.append(np.median(local_vals))
+    return smoothed
+
+
+def overlay_feature(df, feature, thumb_path, out_path, title, cmap="plasma", vmin=None, vmax=None):
+    """Generate overlay visualization of a feature on the slide thumbnail"""
+    if not Path(thumb_path).exists():
+        print(f"Warning: Missing thumbnail: {thumb_path}")
+        return
+    
+    img = np.array(Image.open(thumb_path).convert("RGB"))
+    fig, ax = plt.subplots(figsize=(12, 12))
+    ax.imshow(img)
+    
+    # Use percentile clipping if not specified
+    if vmin is None:
+        vmin = np.percentile(df[feature], 2)
+    if vmax is None:
+        vmax = np.percentile(df[feature], 98)
+    
+    sc = ax.scatter(df["x"], df["y"], c=df[feature], cmap=cmap,
+                    s=4, edgecolor="none", vmin=vmin, vmax=vmax, alpha=0.7)
+    ax.set_title(title, fontsize=16, fontweight='bold')
+    ax.axis("off")
+    plt.colorbar(sc, ax=ax, shrink=0.5)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"Saved overlay: {out_path}")
+
+
+def make_qc_panel(qc_dir, slide_id, overlay_files):
+    """Create QC panel from multiple overlay images"""
+    images = [Image.open(f) for f in overlay_files if Path(f).exists()]
+    if not images:
+        print("Warning: No overlay images found for QC panel")
+        return
+    
+    widths, heights = zip(*(img.size for img in images))
+    panel_width = sum(widths)
+    panel_height = max(heights)
+    
+    panel = Image.new("RGB", (panel_width, panel_height), color=(255, 255, 255))
+    x_offset = 0
+    for img in images:
+        panel.paste(img, (x_offset, 0))
+        x_offset += img.size[0]
+    
+    panel_path = os.path.join(qc_dir, f"panel_overlay_{slide_id}.jpg")
+    panel.save(panel_path, quality=90)
+    print(f"Saved QC panel: {panel_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Extract and visualize nuclear features with coherency and variance")
+    ap.add_argument("--input_csv", required=True, help="Input CSV with basic features")
+    ap.add_argument("--out_csv", required=True, help="Output CSV with enriched features")
+    ap.add_argument("--out_dir", required=True, help="Output directory for visualizations")
+    ap.add_argument("--thumb", required=True, help="Path to slide thumbnail")
+    ap.add_argument("--radii_um", nargs="+", type=float, default=[50, 100, 150], 
+                    help="Radii for local feature computation (micrometers)")
+    ap.add_argument("--features", nargs="+", default=["circularity", "gray_mean", "area_px", "aspect_ratio"],
+                    help="Features to analyze")
+    args = ap.parse_args()
+
+    # Load data
+    print(f"Loading data from {args.input_csv}...")
+    df = pd.read_csv(args.input_csv)
+    print(f"Loaded {len(df):,} nuclei")
+
+    # Calculate circularity if not present
+    if "circularity" not in df.columns:
+        print("Computing circularity...")
+        df["circularity"] = 4 * np.pi * df["area_px"] / np.maximum(df["perimeter_px"] ** 2, 1e-6)
+
+    # Calculate gray_mean from RGB if available
+    has_rgb = {"r", "g", "b"}.issubset(df.columns)
+    if has_rgb and "gray_mean" not in df.columns:
+        print("Computing gray_mean from RGB channels...")
+        df["gray_mean"] = (df["r"] + df["g"] + df["b"]) / 3.0
+    elif not has_rgb and "gray_mean" in args.features:
+        print("Warning: RGB columns not found, skipping gray_mean")
+        args.features = [f for f in args.features if f != "gray_mean"]
+
+    # Ensure output directory exists
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    overlay_files = []
+
+    print(f"\nProcessing {len(args.radii_um)} radii: {args.radii_um}")
+    
+    # === NEW: Compute coherency for each radius ===
+    for radius in args.radii_um:
+        print(f"\nComputing coherency at {radius} um...")
+        coherency_col = f"coherency_{int(radius)}um"
+        df[coherency_col] = compute_coherency(df, radius)
+        
+        # Visualize coherency
+        out_img = os.path.join(args.out_dir, f"overlay_{coherency_col}.jpg")
+        overlay_feature(df, coherency_col, args.thumb, out_img, 
+                       title=f"Nuclear Coherency ({int(radius)}µm)", 
+                       cmap="coolwarm", vmin=0, vmax=1)
+        overlay_files.append(out_img)
+
+    # === NEW: Compute variance and CV for each feature ===
+    print("\nComputing local statistics (mean, variance, CV)...")
+    for feature in args.features:
+        if feature not in df.columns:
+            print(f"Warning: Feature '{feature}' not found in data, skipping")
+            continue
+        
+        for radius in args.radii_um:
+            print(f"  {feature} at {radius} um...")
+            mean, var, cv = compute_local_stats(df, feature, radius)
+            
+            mean_col = f"{feature}_local_mean_{int(radius)}um"
+            var_col = f"{feature}_local_variance_{int(radius)}um"
+            cv_col = f"{feature}_local_cv_{int(radius)}um"
+            
+            df[mean_col] = mean
+            df[var_col] = var
+            df[cv_col] = cv
+            
+            # Visualize variance (most informative)
+            out_img = os.path.join(args.out_dir, f"overlay_{var_col}.jpg")
+            overlay_feature(df, var_col, args.thumb, out_img, 
+                           title=f"{feature.replace('_', ' ').title()} Variance ({int(radius)}µm)")
+            overlay_files.append(out_img)
+
+    # === ORIGINAL: Local median features (kept for compatibility) ===
+    print("\nComputing local median features (original method)...")
+    for feature in args.features:
+        if feature not in df.columns:
+            continue
+        for r in args.radii_um:
+            smoothed = compute_local_feature(df, feature, r)
+            new_col = f"{feature}_local_median_{int(r)}um"
+            df[new_col] = smoothed
+
+    # === Per-channel overlays if RGB available ===
+    if has_rgb:
+        print("\nGenerating per-channel overlays...")
+        cmap_map = {"r": "Reds", "g": "Greens", "b": "Blues"}
+        for channel in ["r", "g", "b"]:
+            out_img = os.path.join(args.out_dir, f"overlay_{channel}.jpg")
+            overlay_feature(df, channel, args.thumb, out_img, 
+                           title=f"{channel.upper()} Channel Intensity", 
+                           cmap=cmap_map[channel])
+            overlay_files.append(out_img)
+
+    # Save enriched CSV
+    print(f"\nSaving enriched features to {args.out_csv}...")
+    df.to_csv(args.out_csv, index=False)
+    print(f"Total features: {len(df.columns)} columns")
+
+    # Generate QC panel
+    print("\nGenerating QC panel...")
+    make_qc_panel(args.out_dir, Path(args.input_csv).stem, overlay_files[:6])  # First 6 images
+
+    print("\nDone!")
+    print(f"Output CSV: {args.out_csv}")
+    print(f"Visualizations: {args.out_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== 06_qc_panel_and_summary.py =====
+import argparse
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+from PIL import Image
+import os
+import json
+import numpy as np
+
+def draw_overlay(df, col, out_path, background, scale=1.0, title=None):
+    if not Path(background).exists():
+        print(f"⚠️ Background not found: {background}")
+        return
+    img = np.array(Image.open(background).convert("RGB"))
+    fig, ax = plt.subplots(figsize=(12, 12))
+    ax.imshow(img)
+    vmin = df[col].quantile(0.02)
+    vmax = df[col].quantile(0.98)
+    sc = ax.scatter(df["x"] / scale, df["y"] / scale, c=df[col],
+                 cmap="plasma", s=4, edgecolor="none",
+                 vmin=vmin, vmax=vmax)
+    ax.set_title(title or col)
+    ax.axis("off")
+    plt.colorbar(sc, ax=ax, shrink=0.5)
+    
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"🖼️ Saved overlay: {out_path}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input_csv", required=True)
+    ap.add_argument("--output_dir", required=True)
+    ap.add_argument("--thumb", required=True)
+    ap.add_argument("--scale", type=float, default=1.0)
+    args = ap.parse_args()
+
+    df = pd.read_csv(args.input_csv)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    summary = {"slide": Path(args.input_csv).stem, "n_nuclei": int(len(df))}
+    for col in df.columns:
+        if col.startswith("corrected_density") or "local" in col:
+            out_img = Path(args.output_dir) / f"{col}_overlay.jpg"
+            draw_overlay(df, col, out_img, args.thumb, scale=args.scale)
+            summary[f"{col}_median"] = float(df[col].median())
+            summary[f"{col}_mean"] = float(df[col].mean())
+
+    with open(Path(args.output_dir) / "qc_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"📄 Saved summary: {args.output_dir}/qc_summary.json")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== 07_compare_segmentation_and_cluster.py =====
+"""
+07_compare_segmentation_and_cluster.py
+
+Full pipeline:
+- Runs Stardist (on GPU if available) on all tiles
+- Extracts nuclear features (shape, color, density)
+- Runs UMAP + BIRCH clustering
+- Saves per-nucleus feature CSV + UMAP plot
+"""
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from skimage.io import imread
+from skimage.measure import regionprops
+from scipy.spatial import cKDTree
+from sklearn.cluster import Birch
+import matplotlib.pyplot as plt
+import tensorflow as tf
+
+from stardist.models import StarDist2D
+from csbdeep.utils import normalize
+from umap import UMAP
+
+# === Config ===
+TILE_DIR = Path("results/CD3-S25/tiles")
+OUT_DIR = Path("results/CD3-S25/comparison")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# === Prefer GPU if available ===
+device = "/GPU:0" if tf.config.list_physical_devices('GPU') else "/CPU:0"
+print(f"🚀 Using device: {device}")
+
+# === Load Stardist model ===
+print("📦 Loading Stardist model...")
+with tf.device(device):
+    model = StarDist2D.from_pretrained('2D_versatile_he')
+
+# === Load all tiles ===
+tile_paths = sorted(TILE_DIR.glob("tile_*.png"))
+print(f"🖼️ Processing {len(tile_paths)} tiles")
+
+all_rows = []
+
+# === Process each tile ===
+for tile_path in tile_paths:
+    print(f"🔍 Segmenting {tile_path.name}")
+    img = imread(tile_path)
+    img_norm = normalize(img)
+
+    with tf.device(device):
+        labels, _ = model.predict_instances(img_norm)
+
+    for prop in regionprops(labels):
+        y, x = prop.centroid
+        area = prop.area
+        perimeter = prop.perimeter
+        circ = (4 * np.pi * area) / (perimeter ** 2 + 1e-6)
+        ecc = prop.eccentricity
+        major = prop.major_axis_length
+        minor = prop.minor_axis_length
+        aspect = major / minor if minor > 0 else 0
+
+        mask = labels == prop.label
+        r = img[:, :, 0][mask].mean()
+        g = img[:, :, 1][mask].mean()
+        b = img[:, :, 2][mask].mean()
+
+        all_rows.append({
+            "tile": tile_path.name,
+            "x": x,
+            "y": y,
+            "area": area,
+            "perimeter": perimeter,
+            "circularity": circ,
+            "aspect_ratio": aspect,
+            "eccentricity": ecc,
+            "r": r,
+            "g": g,
+            "b": b
+        })
+
+# === Assemble DataFrame ===
+df = pd.DataFrame(all_rows)
+print(f"🧬 Extracted {len(df)} nuclei")
+
+# === Compute local density ===
+coords = df[["x", "y"]].values
+tree = cKDTree(coords)
+df["density_r50"] = [len(tree.query_ball_point(p, 50)) - 1 for p in coords]
+
+# === UMAP + BIRCH Clustering ===
+features = df[["area", "aspect_ratio", "circularity", "density_r50", "r", "g", "b"]]
+print("📉 Running UMAP...")
+embedding = UMAP(n_components=2, random_state=42).fit_transform(features)
+df["umap_x"] = embedding[:, 0]
+df["umap_y"] = embedding[:, 1]
+
+print("🔗 Running BIRCH clustering...")
+#birch = Birch(n_clusters=None, threshold=0.5)
+#birch = Birch(n_clusters=30)  # ✅ updated from None
+birch = Birch(n_clusters=30, threshold=0.5)
+
+
+df["cluster"] = birch.fit_predict(embedding)
+
+# === Save results ===
+df_out_path = OUT_DIR / "stardist_clustered_features.csv"
+df.to_csv(df_out_path, index=False)
+print(f"✅ Saved CSV: {df_out_path}")
+
+# === Plot UMAP ===
+plt.figure(figsize=(8, 6))
+scatter = plt.scatter(df["umap_x"], df["umap_y"], c=df["cluster"], cmap="tab10", s=10)
+plt.colorbar(scatter, label="Cluster")
+plt.title("Stardist UMAP + BIRCH Clustering")
+plot_path = OUT_DIR / "stardist_umap_clusters.png"
+plt.savefig(plot_path, dpi=150)
+plt.close()
+print(f"🖼️ Saved plot: {plot_path}")
+
+
+
+===== 07b_generate_cluster_overlays.py =====
+"""
+07b_generate_cluster_overlays.py
+
+Overlay nuclei cluster labels on each tile and save color-coded visualization.
+"""
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from pathlib import Path
+from skimage.io import imread
+import seaborn as sns
+
+# === Paths ===
+CSV_PATH = Path("results/CD3-S25/comparison/stardist_clustered_features.csv")
+TILE_DIR = Path("results/CD3-S25/tiles")
+OUT_DIR = Path("results/CD3-S25/comparison/overlays")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# === Load Data ===
+df = pd.read_csv(CSV_PATH)
+
+# === Cluster colormap ===
+clusters = sorted(df["cluster"].unique())
+palette = sns.color_palette("tab20", len(clusters))
+cluster_color_map = {c: palette[i % len(palette)] for i, c in enumerate(clusters)}
+
+# === Generate overlay per tile ===
+tiles = df["tile"].unique()
+for tile_name in tiles:
+    tile_path = TILE_DIR / tile_name
+    if not tile_path.exists():
+        print(f"⚠️ Tile missing: {tile_path}")
+        continue
+
+    img = imread(tile_path)
+    tile_df = df[df["tile"] == tile_name]
+
+    plt.figure(figsize=(8, 8))
+    plt.imshow(img)
+
+    for cluster_id in clusters:
+        cluster_df = tile_df[tile_df["cluster"] == cluster_id]
+        plt.scatter(
+            cluster_df["x"],
+            cluster_df["y"],
+            s=20,
+            color=cluster_color_map[cluster_id],
+            label=str(cluster_id),
+            alpha=0.7,
+            edgecolor='black',
+            linewidth=0.3
+        )
+
+    # Legend
+    handles = [mpatches.Patch(color=cluster_color_map[c], label=f"Cluster {c}") for c in clusters]
+    plt.legend(handles=handles, loc="upper right", fontsize=8, frameon=True)
+    plt.title(f"Cluster Overlay - {tile_name}")
+    plt.axis("off")
+
+    out_path = OUT_DIR / tile_name.replace(".png", "_overlay.png")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"✅ Saved overlay: {out_path}")
+
+
+
+===== batch_run_00_to_03.sh =====
+#!/bin/bash
+
+set -e  # stop on first error
+set -o pipefail
+
+RAW_DIR="data/raw"
+RESULTS_DIR="results"
+MMP=0.262697
+TILE_SIZE=1024
+OVERLAP=128
+LEVEL=0
+DIAM_UM=10.0
+DEDUP_RADIUS=6.0
+USE_GPU="--gpu"  # remove this if no GPU
+
+echo "🔁 Starting batch run 00 → 03..."
+
+for SLIDE_PATH in ${RAW_DIR}/*.svs; do
+    SLIDE_FILE=$(basename "$SLIDE_PATH")
+    SLIDE_ID="${SLIDE_FILE%.*}"
+
+    echo "----------------------------------------"
+    echo "🧪 Processing: $SLIDE_ID"
+    echo "----------------------------------------"
+
+    OUT_PREVIEW="${RESULTS_DIR}/${SLIDE_ID}/00_preview"
+    OUT_MASK="${RESULTS_DIR}/${SLIDE_ID}/01_mask"
+    OUT_TILES="${RESULTS_DIR}/${SLIDE_ID}/02_tiles"
+    OUT_SEG="${RESULTS_DIR}/${SLIDE_ID}/03_segment"
+
+    #### 00: Quick preview
+    python3 src/00_quick_preview_enhanced.py \
+        --raw "$SLIDE_PATH" \
+        --out_dir "$OUT_PREVIEW" \
+        --crop_size $TILE_SIZE
+
+    #### 01: Tissue mask (low-res)
+    mkdir -p "$OUT_MASK"
+    python3 src/01_tissue_mask.py \
+        --raw "$SLIDE_PATH" \
+        --out "${OUT_MASK}/tissue_mask.png" \
+        --level 2
+
+    #### 02: Tile based on mask
+    python3 src/02_tile_and_stain_norm.py \
+        --raw "$SLIDE_PATH" \
+        --tissue_mask "${OUT_MASK}/tissue_mask.png" \
+        --out_dir "$OUT_TILES" \
+        --tile_size $TILE_SIZE \
+        --overlap $OVERLAP \
+        --level $LEVEL
+
+    #### 03: Segment with Cellpose and deduplicate
+    python3 src/03_segment_and_merge_cellpose.py \
+        --tiles_dir "$OUT_TILES" \
+        --tiles_json "$OUT_TILES/tiles.json" \
+        --masks_dir "$OUT_SEG/masks" \
+        --out_csv "$OUT_SEG/nuclei_features.csv" \
+        --slide_id "$SLIDE_ID" \
+        --mpp $MMP \
+        --diam_um $DIAM_UM \
+        --dedup_radius_um $DEDUP_RADIUS \
+        $USE_GPU
+
+    echo "✅ Done: $SLIDE_ID"
+done
+
+echo "🎉 All slides processed."
+
+
+
+===== batch_run_04_to_06.sh =====
+#!/bin/bash
+set -e
+
+MMP=0.262697
+MASK_LEVEL=2
+DOWNSAMPLES="1.0 4.0 16.0 64.0"
+RADII="50 100"
+FEATURES="circularity gray_mean"
+
+RAW=data/raw
+RESULTS=results
+
+for CSV in $(find $RESULTS -name nuclei_features.csv); do
+    SLIDE=$(basename $(dirname $(dirname "$CSV")))
+    echo "🔁 Processing $SLIDE..."
+
+    ### Step 04 - Density Analysis
+    python3 src/04_density.py \
+      --input_csv "$CSV" \
+      --output_csv "$RESULTS/$SLIDE/04_density/nuclei_with_density.csv" \
+      --mpp $MMP \
+      --radii_um $RADII \
+      --tissue_mask "$RESULTS/$SLIDE/01_mask/tissue_mask.png" \
+      --mask_level $MASK_LEVEL \
+      --downsamples $DOWNSAMPLES \
+      --thumb "$RESULTS/$SLIDE/00_preview/${SLIDE}_thumb.jpg" \
+      --summary_json "$RESULTS/$SLIDE/04_density/density_summary.json"
+
+    ### Step 05 - Feature Enrichment & Overlays
+    python3 src/05_enrich_and_visualize_features.py \
+      --input_csv "$RESULTS/$SLIDE/04_density/nuclei_with_density.csv" \
+      --out_csv "$RESULTS/$SLIDE/05_features/features_enriched.csv" \
+      --out_dir "$RESULTS/$SLIDE/05_features" \
+      --thumb "$RESULTS/$SLIDE/00_preview/${SLIDE}_thumb.jpg" \
+      --radii_um $RADII \
+      --features $FEATURES
+
+    ### Step 06 - QC Panel + Summary
+    python3 src/06_qc_panel_and_summary.py \
+      --input_csv "$RESULTS/$SLIDE/05_features/features_enriched.csv" \
+      --output_dir "$RESULTS/$SLIDE/06_qc" \
+      --thumb "$RESULTS/$SLIDE/00_preview/${SLIDE}_thumb.jpg" \
+      --scale 1.0
+
+    echo "✅ Finished $SLIDE"
+done
+
+echo "🎉 All done!"
+
+
+
+===== create_coherency_zoom_panels.py =====
+#!/usr/bin/env python3
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from PIL import Image
+from pathlib import Path
+
+def create_multi_zoom_panel(csv_path, thumb_path, out_path):
+    """Create panel with 4 zoomed regions showing different areas"""
+    df = pd.read_csv(csv_path)
+    img = np.array(Image.open(thumb_path).convert('RGB'))
+    img_h, img_w = img.shape[:2]
+    
+    print(f"Image size: {img_w} x {img_h}")
+    print(f"Nuclei range: x=[{df['x'].min():.0f}, {df['x'].max():.0f}], y=[{df['y'].min():.0f}, {df['y'].max():.0f}]")
+    
+    # Find 4 interesting regions - ensure they're within image bounds
+    zoom_size = 300
+    margin = zoom_size + 50
+    
+    # Filter to nuclei well within image
+    df_safe = df[
+        (df['x'] > margin) & (df['x'] < img_w - margin) &
+        (df['y'] > margin) & (df['y'] < img_h - margin)
+    ].copy()
+    
+    if len(df_safe) < 100:
+        print("Not enough nuclei in safe region, using all nuclei")
+        df_safe = df.copy()
+    
+    # 1. Highest coherency
+    high_coh = df_safe.nlargest(500, 'coherency_150um')
+    region1 = (high_coh['x'].median(), high_coh['y'].median())
+    
+    # 2. Lowest coherency  
+    low_coh = df_safe.nsmallest(500, 'coherency_150um')
+    region2 = (low_coh['x'].median(), low_coh['y'].median())
+    
+    # 3. Highest density
+    high_dens = df_safe.nlargest(500, 'corrected_density_um2_r50.0')
+    region3 = (high_dens['x'].median(), high_dens['y'].median())
+    
+    # 4. Center region
+    region4 = (df['x'].median(), df['y'].median())
+    
+    regions = [
+        (region1, "Highest Coherency"),
+        (region2, "Lowest Coherency"),
+        (region3, "High Density"),
+        (region4, "Center Region")
+    ]
+    
+    # Create 2x2 panel
+    fig = plt.figure(figsize=(16, 16))
+    gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
+    
+    subsample = 3
+    arrow_scale = 15
+    
+    for plot_idx, ((cx, cy), title) in enumerate(regions):
+        print(f"\nProcessing region {plot_idx+1}: {title} at ({cx:.0f}, {cy:.0f})")
+        
+        row = plot_idx // 2
+        col = plot_idx % 2
+        
+        ax = fig.add_subplot(gs[row, col])
+        
+        # Define region with bounds checking
+        x_min = int(max(0, cx - zoom_size))
+        x_max = int(min(img_w, cx + zoom_size))
+        y_min = int(max(0, cy - zoom_size))
+        y_max = int(min(img_h, cy + zoom_size))
+        
+        print(f"  Bounds: x=[{x_min}, {x_max}], y=[{y_min}, {y_max}]")
+        
+        # Skip if region is too small
+        if (x_max - x_min) < 100 or (y_max - y_min) < 100:
+            print(f"  Skipping - region too small")
+            continue
+        
+        # Get nuclei in region
+        df_region = df[
+            (df['x'] >= x_min) & (df['x'] <= x_max) &
+            (df['y'] >= y_min) & (df['y'] <= y_max)
+        ].copy()
+        
+        print(f"  Nuclei in region: {len(df_region)}")
+        
+        if len(df_region) < 10:
+            print(f"  Skipping - too few nuclei")
+            continue
+            
+        # Subsample for visualization
+        df_sub = df_region.iloc[::subsample]
+        angles = np.arctan2(df_sub['minor_axis_length'], 
+                           df_sub['major_axis_length'])
+        
+        # Crop image
+        img_crop = img[y_min:y_max, x_min:x_max]
+        
+        if img_crop.size == 0:
+            print(f"  Skipping - empty crop")
+            continue
+        
+        ax.imshow(img_crop, extent=[x_min, x_max, y_max, y_min])
+        
+        # Draw arrows
+        for idx_row, nucleus in df_sub.iterrows():
+            angle = angles[idx_row]
+            length = nucleus['major_axis_length'] / 2 * arrow_scale
+            
+            dx = length * np.cos(angle)
+            dy = length * np.sin(angle)
+            
+            ax.arrow(nucleus['x'], nucleus['y'], dx, dy,
+                    head_width=4, head_length=6,
+                    fc='yellow', ec='red', alpha=0.9, linewidth=2)
+        
+        # Stats
+        coh_mean = df_region['coherency_150um'].mean()
+        coh_std = df_region['coherency_150um'].std()
+        n_cells = len(df_region)
+        
+        ax.set_title(f'{title}\nCells: {n_cells}, Coh: {coh_mean:.3f}±{coh_std:.3f}', 
+                    fontsize=12, fontweight='bold')
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_max, y_min)
+        ax.axis('off')
+    
+    plt.suptitle('Coherency Validation - Zoomed Regions', 
+                 fontsize=16, fontweight='bold')
+    
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"\nSaved: {out_path}")
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--thumb", required=True)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+    
+    create_multi_zoom_panel(args.csv, args.thumb, args.out)
+
+
+
+===== draw_cluster_overlay_per_tile.py =====
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+from PIL import Image
+
+# === CONFIG ===
+CSV_PATH = Path("results/CD3-S25/comparison/stardist_clustered_features.csv")
+TILE_DIR = Path("results/CD3-S25/tiles")
+OUT_DIR = Path("results/CD3-S25/comparison/overlays")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# === Load CSV ===
+df = pd.read_csv(CSV_PATH)
+
+# === Get unique tiles ===
+for tile_name in df["tile"].unique():
+    tile_path = TILE_DIR / tile_name
+    if not tile_path.exists():
+        print(f"❌ Missing tile: {tile_name}")
+        continue
+
+    # Load image
+    img = np.array(Image.open(tile_path).convert("RGB"))
+
+    # Subset of nuclei from this tile
+    sub_df = df[df["tile"] == tile_name]
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(img)
+    scatter = ax.scatter(
+        sub_df["x"],
+        sub_df["y"],
+        c=sub_df["cluster"],
+        cmap="tab20",
+        s=10,
+        edgecolor="none"
+    )
+    ax.set_title(f"Cluster Overlay - {tile_name}")
+    ax.axis("off")
+    plt.colorbar(scatter, ax=ax, shrink=0.5, label="Cluster")
+
+    # Save
+    out_path = OUT_DIR / tile_name.replace(".png", "_overlay.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"✅ Saved overlay: {out_path}")
+
+
+
+===== gif_helpers.py =====
+import imageio
+from PIL import Image
+
+def make_crop_gif(thumb_path, crop_path, out_path, duration=1.0):
+    """Create a GIF cycling between thumbnail and crop."""
+    thumb = Image.open(thumb_path).convert("RGB")
+    crop = Image.open(crop_path).convert("RGB")
+    thumb = thumb.resize(crop.size)
+    imageio.mimsave(out_path, [thumb, crop], duration=duration)
+    print(f"🎞️  Saved crop GIF: {out_path}")
+
+
+
+===== make_demo_panel.py =====
+#!/usr/bin/env python3
+"""
+Generate demonstration panel for meeting showing new features.
+Usage: python make_demo_panel.py --slide_name CD3-S25 --results_dir results
+"""
+
+import argparse
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from PIL import Image
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+
+def create_demo_panel(slide_name, results_dir):
+    """Create comprehensive demo panel showing old + new features"""
+    
+    base = Path(results_dir) / slide_name
+    
+    # Check if results exist
+    if not base.exists():
+        print(f"Error: Results directory not found: {base}")
+        print(f"Make sure you've run the pipeline on {slide_name}")
+        return
+    
+    # Load images
+    try:
+        thumb = Image.open(base / "preview" / f"{slide_name}_thumb.jpg")
+        seg_qc = Image.open(base / "cellpose" / "qc_panel.jpg")
+        
+        # Try to load density maps
+        density_50 = base / "features" / "density_overlay_r50.jpg"
+        density_150 = base / "features" / "density_overlay_r150.jpg"
+        
+        # New features
+        coherency = base / "viz" / "overlay_coherency_150um.jpg"
+        variance = base / "viz" / "overlay_area_px_local_variance_150um.jpg"
+        
+        # Load CSV for statistics
+        csv_path = base / "features" / f"{slide_name}_nuclei_features_enriched.csv"
+        
+    except FileNotFoundError as e:
+        print(f"Error: Missing file - {e}")
+        print("Run the complete pipeline first:")
+        print(f"  ./run_one_slide.sh /path/to/{slide_name}.svs results")
+        return
+    
+    # Create figure with custom layout
+    fig = plt.figure(figsize=(20, 12))
+    gs = GridSpec(2, 4, figure=fig, hspace=0.3, wspace=0.3)
+    
+    # Row 1: Original results
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(thumb)
+    ax1.set_title("A. H&E Slide", fontsize=14, fontweight='bold')
+    ax1.axis('off')
+    
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.imshow(seg_qc)
+    ax2.set_title("B. Segmentation QC", fontsize=14, fontweight='bold')
+    ax2.axis('off')
+    
+    if density_50.exists():
+        ax3 = fig.add_subplot(gs[0, 2])
+        ax3.imshow(Image.open(density_50))
+        ax3.set_title("C. Density (50µm)", fontsize=14, fontweight='bold')
+        ax3.axis('off')
+    
+    if density_150.exists():
+        ax4 = fig.add_subplot(gs[0, 3])
+        ax4.imshow(Image.open(density_150))
+        ax4.set_title("D. Density (150µm) - NEW", fontsize=14, fontweight='bold', color='red')
+        ax4.axis('off')
+    
+    # Row 2: New features
+    if coherency.exists():
+        ax5 = fig.add_subplot(gs[1, 0])
+        ax5.imshow(Image.open(coherency))
+        ax5.set_title("E. Coherency - NEW ✓", fontsize=14, fontweight='bold', color='red')
+        ax5.axis('off')
+    
+    if variance.exists():
+        ax6 = fig.add_subplot(gs[1, 1])
+        ax6.imshow(Image.open(variance))
+        ax6.set_title("F. Area Variance - NEW ✓", fontsize=14, fontweight='bold', color='red')
+        ax6.axis('off')
+    
+    # Statistics panel
+    ax7 = fig.add_subplot(gs[1, 2:])
+    ax7.axis('off')
+    
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        
+        # Check which new columns exist
+        has_coherency = any('coherency' in col for col in df.columns)
+        has_variance = any('variance' in col for col in df.columns)
+        
+        stats_text = f"""PROGRESS UPDATE - {slide_name}
+        
+        COMPLETED:
+        - Coherency metric 
+        - Variance features
+        - 150um radius added
+        
+        RESULTS:
+        - Nuclei: {len(df):,}
+        - Coherency: {df['coherency_150um'].mean():.3f if has_coherency else 'N/A'}
+        - Variance: {df['area_px_local_variance_150um'].mean():.1f if has_variance else 'N/A'}
+        - Features: {len(df.columns)} columns
+        
+        NEXT WEEK:
+        - Cellpose vs StarDist
+        - IHC brown stain
+        - Enhanced clustering
+        """
+        
+        ax7.text(0.05, 0.5, stats_text, 
+                fontsize=11, 
+                family='monospace', 
+                va='center',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    
+    plt.suptitle(f"HistoVision Pipeline Progress - {slide_name}", 
+                 fontsize=18, fontweight='bold', y=0.98)
+    
+    # Save
+    output_path = base / f"DEMO_PANEL_for_meeting_{slide_name}.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    print(f"\n{'='*60}")
+    print(f"✓ Saved demo panel: {output_path}")
+    print(f"{'='*60}\n")
+    
+    # Also save as PDF for higher quality
+    pdf_path = base / f"DEMO_PANEL_for_meeting_{slide_name}.pdf"
+    plt.savefig(pdf_path, bbox_inches='tight', facecolor='white')
+    print(f"✓ Also saved PDF: {pdf_path}\n")
+    
+    plt.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate demo panel for meeting")
+    parser.add_argument("--slide_name", required=True, 
+                       help="Slide name (e.g., CD3-S25)")
+    parser.add_argument("--results_dir", default="results", 
+                       help="Results directory (default: results)")
+    args = parser.parse_args()
+    
+    create_demo_panel(args.slide_name, args.results_dir)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== make_demo_panel_simple.py =====
+#!/usr/bin/env python3
+import argparse
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from PIL import Image
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+def create_demo_panel(slide_name, results_dir):
+    base = Path(results_dir) / slide_name
+    
+    if not base.exists():
+        print(f"Error: {base} not found")
+        return
+    
+    fig = plt.figure(figsize=(20, 12))
+    gs = GridSpec(2, 4, figure=fig, hspace=0.3, wspace=0.3)
+    
+    # Load images
+    thumb = Image.open(base / "preview" / f"{slide_name}_thumb.jpg")
+    
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.imshow(thumb)
+    ax1.set_title("A. H&E Slide", fontsize=14, fontweight='bold')
+    ax1.axis('off')
+    
+    # Try to load other images
+    # Around line 25, change the img_paths list:
+    
+    img_paths = [
+        (gs[0, 1], "cellpose/qc_panel.jpg", "B. Segmentation"),
+        (gs[0, 2], "features/density_overlay_r50.0.jpg", "C. Density 50µm"),  # Note: r50.0 not r50
+        (gs[0, 3], "features/density_overlay_r150.0.jpg", "D. Density 150µm NEW"),  # r150.0
+        (gs[1, 0], "viz/overlay_coherency_150um.jpg", "E. Coherency NEW"),
+        (gs[1, 1], "viz/overlay_area_px_local_variance_150um.jpg", "F. Variance NEW"),
+    ]
+    
+    for grid_pos, img_path, title in img_paths:
+        full_path = base / img_path
+        if full_path.exists():
+            ax = fig.add_subplot(grid_pos)
+            ax.imshow(Image.open(full_path))
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.axis('off')
+    
+    # Stats panel
+    ax7 = fig.add_subplot(gs[1, 2:])
+    ax7.axis('off')
+    
+    csv_path = base / "features" / f"{slide_name}_nuclei_features_enriched.csv"
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        has_coh = 'coherency_150um' in df.columns
+        has_var = 'area_px_local_variance_150um' in df.columns
+        
+        # Simple text without f-string issues
+        lines = [
+            f"PROGRESS UPDATE - {slide_name}",
+            "",
+            "COMPLETED:",
+            "- Coherency metric",
+            "- Variance features", 
+            "- 150um radius",
+            "",
+            "RESULTS:",
+            f"- Total nuclei: {len(df):,}",
+        ]
+        
+        if has_coh:
+            lines.append(f"- Coherency mean: {df['coherency_150um'].mean():.3f}")
+        if has_var:
+            lines.append(f"- Variance mean: {df['area_px_local_variance_150um'].mean():.1f}")
+        
+        lines.extend([
+            f"- Total features: {len(df.columns)}",
+            "",
+            "NEXT WEEK:",
+            "- Cellpose vs StarDist",
+            "- IHC brown stain",
+            "- Enhanced clustering",
+        ])
+        
+        text = '\n'.join(lines)
+        ax7.text(0.1, 0.5, text, fontsize=12, family='monospace', va='center',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    
+    plt.suptitle(f"Pipeline Progress - {slide_name}", fontsize=18, fontweight='bold')
+    
+    output_path = base / f"DEMO_PANEL_{slide_name}.png"
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
+    print(f"\nSaved: {output_path}\n")
+    plt.close()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--slide_name", required=True)
+    parser.add_argument("--results_dir", default="results")
+    args = parser.parse_args()
+    create_demo_panel(args.slide_name, args.results_dir)
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== run_HE-B27.sh =====
+#!/bin/bash
+bash src/run_one_slide.sh data/raw/HE=B27.svs 2>&1 | tee logs/HE-B27.log
+
+
+
+===== run_HE-S17.sh =====
+#!/bin/bash
+bash src/run_one_slide.sh data/raw/HE-S17.svs 2>&1 | tee logs/HE-S17.log
+
+
+
+===== run_HE-S25.sh =====
+#!/bin/bash
+bash src/run_one_slide.sh data/raw/HE-S25.svs 2>&1 | tee logs/HE-S25.log
+
+
+
+===== run_NF-S19.sh =====
+#!/bin/bash
+bash src/run_one_slide.sh data/raw/NF-S19.svs 2>&1 | tee logs/NF-S19.log
+
+
+
+===== run_PGP9-5-B27.sh =====
+#!/bin/bash
+bash src/run_one_slide.sh data/raw/PGP9-5-B27.svs 2>&1 | tee logs/PGP9-5-B27.log
+
+
+
+===== run_all.sh =====
+#!/bin/bash
+
+SLIDES_DIR="data/raw"
+OUT_DIR="outputs"
+MPP=0.262697
+DIAM=10
+RADII="50 100"
+
+for slide in $SLIDES_DIR/*.svs; do
+    SLIDE_NAME=$(basename "$slide" .svs)
+    echo "🚀 Processing $SLIDE_NAME"
+
+    python src/run_full_pipeline.py \
+      --slide "$slide" \
+      --out_base "$OUT_DIR" \
+      --mpp $MPP \
+      --diam_um $DIAM \
+      --radii_um $RADII \
+      --overwrite
+done
+
+
+
+===== run_all_slides.sh =====
+#!/bin/bash
+set -e  # Exit on error
+
+# === CONFIGURATION ===
+RAW_DIR="data/raw"
+RESULTS_DIR="results"
+RADIUS_UM=100
+
+# Get list of .svs slides
+slides=($(ls $RAW_DIR/*.svs))
+
+for slide_path in "${slides[@]}"; do
+    SLIDE=$(basename "$slide_path")
+    SLIDE_NAME="${SLIDE%.*}"
+    SLIDE_OUT="$RESULTS_DIR/$SLIDE_NAME"
+
+    mkdir -p "$SLIDE_OUT/inspect"
+
+    echo "🚀 Processing $SLIDE_NAME"
+
+    # Step 00: Inspect slides and save summary
+    python3 src/00_inspect_wsi.py \
+        --raw_dir "$RAW_DIR" \
+        --out "$SLIDE_OUT/inspect/slide_summary.md"
+
+    # Extract MPP value for this slide
+    MPP=$(awk -F'|' -v s="$SLIDE" '$2 ~ s {gsub(/ /,"",$5); print $5}' "$SLIDE_OUT/inspect/slide_summary.md")
+
+    # Step 00b: Generate quick preview (thumbnail + crop)
+    python3 src/00_quick_preview_enhanced.py \
+        --raw "$slide_path" \
+        --out_dir "$SLIDE_OUT/preview" \
+        --crop_size 1024
+
+    # Step 01: Tissue Mask
+    python3 src/01_tissue_mask.py \
+        --raw "$slide_path" \
+        --out "$SLIDE_OUT/mask/mask_level2.png" \
+        --level 2 --overwrite
+
+    # Step 02: Tile and Normalize
+    python3 src/02_tile_and_stain_norm.py \
+        --raw "$slide_path" \
+        --tissue_mask "$SLIDE_OUT/mask/mask_level2.png" \
+        --out_dir "$SLIDE_OUT/tiles" \
+        --tile_size 1024 \
+        --overlap 128 \
+        --level 0
+
+    # Step 03: Segment nuclei
+    python3 src/03_segment_and_merge_cellpose.py \
+        --tiles_dir "$SLIDE_OUT/tiles" \
+        --tiles_json "$SLIDE_OUT/tiles/tiles.json" \
+        --masks_dir "$SLIDE_OUT/seg" \
+        --out_csv "$SLIDE_OUT/features/${SLIDE_NAME}_nuclei_features.csv" \
+        --slide_id "$SLIDE_NAME" \
+        --mpp "$MPP" \
+        --diam_um 10 \
+        --batch_size 4 \
+        --gpu \
+        --dedup_radius_um 6
+
+    # Step 04: Density profiling
+    python3 src/04_density.py \
+        --input_csv "$SLIDE_OUT/features/${SLIDE_NAME}_nuclei_features.csv" \
+        --output_csv "$SLIDE_OUT/features/${SLIDE_NAME}_nuclei_features_with_density.csv" \
+        --mpp "$MPP" \
+        --radii_um "$RADIUS_UM"
+
+    # Step 05: Feature enrichment & visualization
+    python3 src/05_enrich_and_visualize_features.py \
+        --input_csv "$SLIDE_OUT/features/${SLIDE_NAME}_nuclei_features_with_density.csv" \
+        --output_csv "$SLIDE_OUT/features/${SLIDE_NAME}_nuclei_features_enriched.csv" \
+        --mpp "$MPP" \
+        --features area_px circularity mean_gray aspect_ratio \
+        --radii_um "$RADIUS_UM" \
+        --thumb "$SLIDE_OUT/preview/${SLIDE_NAME}_thumb.jpg" \
+        --out_dir "$SLIDE_OUT/viz/features"
+
+    # Step 06: QC overlays + per-slide summary
+    python3 src/06_qc_panel_and_summary.py \
+        --mode per_slide \
+        --csv "$SLIDE_OUT/features/${SLIDE_NAME}_nuclei_features_enriched.csv" \
+        --thumb "$SLIDE_OUT/preview/${SLIDE_NAME}_thumb.jpg" \
+        --out_dir "$SLIDE_OUT/qc" \
+        --mpp "$MPP" \
+        --slide_id "$SLIDE_NAME" \
+        --features circularity aspect_ratio mean_gray \
+        --radii_um "$RADIUS_UM"
+
+    # 🧹 Free caches between slides to avoid OOM
+    sync; echo 3 > /proc/sys/vm/drop_caches || true
+    sleep 10
+done
+
+# Step 07: Merge QC summaries across all slides
+python3 src/06_qc_panel_and_summary.py \
+    --mode batch_merge \
+    --root_dir "$RESULTS_DIR" \
+    --out_csv "$RESULTS_DIR/qc_summary.csv"
+
+
+
+===== run_demo.sh =====
+#!/bin/bash
+# Quick demo script to test new features on one slide
+# Usage: ./run_demo.sh /path/to/slide.svs
+
+set -euo pipefail
+
+SLIDE_PATH="${1:-}"
+
+if [[ -z "$SLIDE_PATH" ]]; then
+    echo "Usage: $0 /path/to/slide.svs"
+    echo ""
+    echo "This runs the pipeline with NEW features:"
+    echo "  • Coherency metric"
+    echo "  • Variance statistics"
+    echo "  • 150µm radius (matching HistoVision paper)"
+    echo "  • Coordinate mapping fix"
+    exit 1
+fi
+
+if [[ ! -f "$SLIDE_PATH" ]]; then
+    echo "Error: Slide not found: $SLIDE_PATH"
+    exit 1
+fi
+
+# Get slide name
+SLIDE_NAME=$(basename "$SLIDE_PATH" .svs)
+echo "Processing: $SLIDE_NAME"
+
+# Output directories
+RESULTS_DIR="results_demo"
+SLIDE_OUT="$RESULTS_DIR/$SLIDE_NAME"
+
+# Run main pipeline with NEW parameters
+echo ""
+echo "Running pipeline with NEW features enabled..."
+echo "  - Density radii: 50, 100, 150 µm"
+echo "  - Features: coherency, variance, CV"
+echo ""
+
+./run_one_slide.sh "$SLIDE_PATH" "$RESULTS_DIR" 10 "50 100 150"
+
+# Generate demo panel
+echo ""
+echo "Generating demo panel for meeting..."
+python make_demo_panel.py --slide_name "$SLIDE_NAME" --results_dir "$RESULTS_DIR"
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "✓ DEMO COMPLETE"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "Results in: $SLIDE_OUT"
+echo ""
+echo "Key outputs:"
+echo "  • Features CSV: $SLIDE_OUT/features/${SLIDE_NAME}_nuclei_features_enriched.csv"
+echo "  • Demo panel: $SLIDE_OUT/DEMO_PANEL_for_meeting_${SLIDE_NAME}.png"
+echo "  • Coherency map: $SLIDE_OUT/viz/overlay_coherency_150um.jpg"
+echo "  • Variance maps: $SLIDE_OUT/viz/overlay_*_variance_*.jpg"
+echo ""
+echo "Open the demo panel to see everything in one view!"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+
+
+===== run_one_slide.sh =====
+#!/bin/bash
+set -euo pipefail
+
+# Usage:
+#   ./run_one_slide.sh path/to/slide.svs [RESULTS_DIR=results] [NUC_DIAM_UM=10] [DENSITY_RADII_UM="50 100"]
+# Notes:
+#   - Assumes python scripts are in ./src/ (relative to this file). Override via SRC_DIR=/abs/path ./run_one_slide.sh ...
+
+RAW_SLIDE="${1:-}"
+RESULTS_DIR="${2:-results}"
+NUC_DIAM_UM="${3:-10}"
+DENSITY_RADII_UM="${4:-50 100}"
+
+if [[ -z "$RAW_SLIDE" ]]; then
+  echo "❌ Usage: $0 path/to/slide.svs [results_dir] [nucleus_diameter_um] [\"r1 r2 ...\"]"
+  exit 1
+fi
+if [[ ! -f "$RAW_SLIDE" ]]; then
+  echo "❌ Slide not found: $RAW_SLIDE"
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+SRC_DIR="${SRC_DIR:-"$SCRIPT_DIR"}"   # scripts live in src/ already
+
+mkdir -p logs results
+
+# Output layout
+SLIDE_BASENAME="$(basename "$RAW_SLIDE")"
+SLIDE_NAME="${SLIDE_BASENAME%.*}"
+SLIDE_OUT="$RESULTS_DIR/$SLIDE_NAME"
+
+PREVIEW_DIR="$SLIDE_OUT/preview"
+MASKS_DIR="$SLIDE_OUT/masks"
+TILES_DIR="$SLIDE_OUT/tiles"
+CELLPOSE_DIR="$SLIDE_OUT/cellpose"
+FEATURES_DIR="$SLIDE_OUT/features"
+VIZ_DIR="$SLIDE_OUT/viz"
+QC_DIR="$SLIDE_OUT/qc"
+mkdir -p "$PREVIEW_DIR" "$MASKS_DIR" "$TILES_DIR" "$CELLPOSE_DIR" "$FEATURES_DIR" "$VIZ_DIR" "$QC_DIR"
+
+# ---- Read MPP and downsamples safely (no argv issues) ----
+SLIDE_PATH="$RAW_SLIDE"
+read -r MPP DOWNSAMPLES <<< "$(
+SLIDE_PATH="$SLIDE_PATH" python3 - <<'PY'
+import os, openslide
+p = os.environ['SLIDE_PATH']
+sl = openslide.OpenSlide(p)
+props = sl.properties
+mpp = None
+for k in ("openslide.mpp-x", "openslide.mpp-y"):
+    v = props.get(k)
+    try:
+        if v is not None:
+            mpp = float(v); break
+    except Exception:
+        pass
+if mpp is None:
+    mpp = 0.25
+downs = [float(d) for d in sl.level_downsamples]
+print(mpp, " ".join(str(d) for d in downs))
+PY
+)"
+echo "ℹ️  MPP: $MPP"
+echo "ℹ️  Level downsamples: $DOWNSAMPLES"
+
+# Array forms
+read -r -a RADII_ARR <<< "$DENSITY_RADII_UM"
+read -r -a DOWNS_ARR <<< "$DOWNSAMPLES"
+
+# Common paths
+THUMB_PATH="$PREVIEW_DIR/${SLIDE_NAME}_thumb.jpg"
+TISSUE_MASK_PATH="$MASKS_DIR/${SLIDE_NAME}_tissue_mask.png"
+TILES_JSON="$TILES_DIR/tiles.json"
+CELLPOSE_MASKS_DIR="$CELLPOSE_DIR/masks"
+RAW_FEATURES_CSV="$FEATURES_DIR/${SLIDE_NAME}_nuclei_features.csv"
+DENSITY_CSV="$FEATURES_DIR/${SLIDE_NAME}_nuclei_features_density.csv"
+SUMMARY_JSON="$FEATURES_DIR/${SLIDE_NAME}_summary.json"
+ENRICHED_FEATURES_CSV="$FEATURES_DIR/${SLIDE_NAME}_nuclei_features_enriched.csv"
+
+# 00 preview
+python3 "$SRC_DIR/00_quick_preview_enhanced.py" \
+  --raw "$RAW_SLIDE" --out_dir "$PREVIEW_DIR" --crop_size 1024
+
+# 01 tissue mask
+python3 "$SRC_DIR/01_tissue_mask.py" \
+  --raw "$RAW_SLIDE" --out "$TISSUE_MASK_PATH" --level 2 --overwrite
+
+# 02 tiling (+ optional stain norm inside)
+python3 "$SRC_DIR/02_tile_and_stain_norm.py" \
+  --raw "$RAW_SLIDE" --tissue_mask "$TISSUE_MASK_PATH" \
+  --out_dir "$TILES_DIR" --tile_size 1024 --overlap 128 --level 0
+
+# 03 cellpose seg + merge
+mkdir -p "$CELLPOSE_MASKS_DIR"
+SEG_ARGS=(
+  --tiles_dir "$TILES_DIR"
+  --tiles_json "$TILES_JSON"
+  --masks_dir "$CELLPOSE_MASKS_DIR"
+  --out_csv "$RAW_FEATURES_CSV"
+  --slide_id "$SLIDE_NAME"
+  --mpp "$MPP"
+  --diam_um "$NUC_DIAM_UM"
+  --batch_size 8
+  --gpu
+)
+python3 "$SRC_DIR/03_segment_and_merge_cellpose.py" "${SEG_ARGS[@]}"
+
+# 04 density + summary
+python3 "$SRC_DIR/04_density.py" \
+  --input_csv "$RAW_FEATURES_CSV" --output_csv "$DENSITY_CSV" \
+  --mpp "$MPP" --radii_um "${RADII_ARR[@]}" \
+  --tissue_mask "$TISSUE_MASK_PATH" --mask_level 2 \
+  --downsamples "${DOWNS_ARR[@]}" \
+  --thumb "$THUMB_PATH" --summary_json "$SUMMARY_JSON" \
+  --percentile_clip 2 98
+
+# 05 enrich + visualizations
+python3 "$SRC_DIR/05_enrich_and_visualize_features.py" \
+  --input_csv "$DENSITY_CSV" --out_csv "$ENRICHED_FEATURES_CSV" \
+  --out_dir "$VIZ_DIR" --thumb "$THUMB_PATH" \
+  --radii_um "${RADII_ARR[@]}" --features circularity gray_mean
+
+# 06 QC
+python3 "$SRC_DIR/06_qc_panel_and_summary.py" \
+  --input_csv "$ENRICHED_FEATURES_CSV" --output_dir "$QC_DIR" \
+  --thumb "$THUMB_PATH" --scale 1.0
+
+echo "✅ Finished $SLIDE_NAME"
+echo "📂 Outputs in: $SLIDE_OUT"
+
+
+
+===== run_one_slide_stardist.sh =====
+#!/bin/bash
+set -euo pipefail
+
+# Usage:
+#   src/run_one_slide_stardist.sh path/to/slide.svs [RESULTS_DIR=results] [NUC_DIAM_UM=10] ["50 100"]
+# Notes:
+#   - Mirrors your existing run_one_slide.sh, but step 03 uses StarDist.
+#   - Expects Python scripts already in src/: 00_quick_preview_enhanced.py, 01_tissue_mask.py,
+#     02_tile_and_stain_norm.py, 03_segment_and_merge_stardist.py, 04_density.py, 05_enrich_and_visualize_features.py,
+#     06_qc_panel_and_summary.py (and optional 07*, 07b* if you have them).
+#
+# StarDist tunables (override via env):
+#   STARDIST_MODEL (default 2D_versatile_he)  # or a path to your custom model dir
+#   STARDIST_PROB   (default 0.5)
+#   STARDIST_NMS    (default 0.4)
+#   BATCH_SIZE      (default 8)
+#   DEDUP_RADIUS_UM (default 6.0)
+#
+# Example:
+#   src/run_one_slide_stardist.sh raw_slides/PGP9-5-B27.svs results_pgp_stardist 10 "50 100 150"
+
+RAW_SLIDE="${1:-}"
+RESULTS_DIR="${2:-results}"
+NUC_DIAM_UM="${3:-10}"
+DENSITY_RADII_UM="${4:-50 100}"
+
+if [[ -z "$RAW_SLIDE" ]]; then
+  echo "❌ Usage: $0 path/to/slide.svs [results_dir] [nucleus_diameter_um] [\"r1 r2 ...\"]"
+  exit 1
+fi
+if [[ ! -f "$RAW_SLIDE" ]]; then
+  echo "❌ Slide not found: $RAW_SLIDE"
+  exit 1
+fi
+
+# ---- StarDist settings (env-overridable) ----
+STARDIST_MODEL="${STARDIST_MODEL:-2D_versatile_he}"
+STARDIST_PROB="${STARDIST_PROB:-0.5}"
+STARDIST_NMS="${STARDIST_NMS:-0.4}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+DEDUP_RADIUS_UM="${DEDUP_RADIUS_UM:-6.0}"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+SRC_DIR="${SRC_DIR:-"$SCRIPT_DIR"}"   # scripts live in src/ already
+
+mkdir -p logs results
+
+# Output layout
+SLIDE_BASENAME="$(basename "$RAW_SLIDE")"
+SLIDE_NAME="${SLIDE_BASENAME%.*}"
+SLIDE_OUT="$RESULTS_DIR/$SLIDE_NAME"
+
+PREVIEW_DIR="$SLIDE_OUT/preview"
+MASKS_DIR="$SLIDE_OUT/masks"
+TILES_DIR="$SLIDE_OUT/tiles"
+STARDIST_DIR="$SLIDE_OUT/stardist"
+FEATURES_DIR="$SLIDE_OUT/features"
+VIZ_DIR="$SLIDE_OUT/viz"
+QC_DIR="$SLIDE_OUT/qc"
+mkdir -p "$PREVIEW_DIR" "$MASKS_DIR" "$TILES_DIR" "$STARDIST_DIR" "$FEATURES_DIR" "$VIZ_DIR" "$QC_DIR"
+
+# ---- Read MPP and downsamples, with graceful fallback if openslide is missing ----
+SLIDE_PATH="$RAW_SLIDE"
+read -r MPP DOWNSAMPLES <<< "$(
+SLIDE_PATH="$SLIDE_PATH" python3 - <<'PY' || true
+import os, sys
+mpp_default = 0.25
+downs_default = "1.0"
+try:
+    import openslide
+    p = os.environ['SLIDE_PATH']
+    sl = openslide.OpenSlide(p)
+    props = sl.properties
+    mpp = None
+    for k in ("openslide.mpp-x", "openslide.mpp-y"):
+        v = props.get(k)
+        try:
+            if v is not None:
+                mpp = float(v); break
+        except Exception:
+            pass
+    if mpp is None:
+        mpp = mpp_default
+    downs = [float(d) for d in sl.level_downsamples]
+    print(mpp, " ".join(str(d) for d in downs))
+except Exception as e:
+    # No openslide or failure: fallback
+    print(mpp_default, downs_default)
+PY
+)"
+echo "ℹ️  MPP: $MPP"
+echo "ℹ️  Level downsamples: ${DOWNSAMPLES:-1.0}"
+
+# Arrays
+read -r -a RADII_ARR <<< "$DENSITY_RADII_UM"
+read -r -a DOWNS_ARR <<< "${DOWNSAMPLES:-1.0}"
+
+# Common paths
+THUMB_PATH="$PREVIEW_DIR/${SLIDE_NAME}_thumb.jpg"
+TISSUE_MASK_PATH="$MASKS_DIR/${SLIDE_NAME}_tissue_mask.png"
+TILES_JSON="$TILES_DIR/tiles.json"
+STARDIST_MASKS_DIR="$STARDIST_DIR/masks"
+mkdir -p "$STARDIST_MASKS_DIR"
+
+RAW_FEATURES_CSV="$FEATURES_DIR/${SLIDE_NAME}_nuclei_features.csv"
+DENSITY_CSV="$FEATURES_DIR/${SLIDE_NAME}_nuclei_features_density.csv"
+SUMMARY_JSON="$FEATURES_DIR/${SLIDE_NAME}_summary.json"
+ENRICHED_FEATURES_CSV="$FEATURES_DIR/${SLIDE_NAME}_nuclei_features_enriched.csv"
+
+# --------------------------- Pipeline ---------------------------
+
+# 00 preview
+echo "==> [00] Quick preview"
+python3 "$SRC_DIR/00_quick_preview_enhanced.py" \
+  --raw "$RAW_SLIDE" --out_dir "$PREVIEW_DIR" --crop_size 1024
+
+# 01 tissue mask
+echo "==> [01] Tissue mask"
+python3 "$SRC_DIR/01_tissue_mask.py" \
+  --raw "$RAW_SLIDE" --out "$TISSUE_MASK_PATH" --level 2 --overwrite
+
+# 02 tiling (+ optional stain norm inside)
+echo "==> [02] Tile + stain norm"
+python3 "$SRC_DIR/02_tile_and_stain_norm.py" \
+  --raw "$RAW_SLIDE" --tissue_mask "$TISSUE_MASK_PATH" \
+  --out_dir "$TILES_DIR" --tile_size 1024 --overlap 128 --level 0
+
+# 03 StarDist segmentation + merge  (REPLACES Cellpose)
+echo "==> [03] StarDist segmentation + merge"
+SEG_ARGS=(
+  --tiles_dir "$TILES_DIR"
+  --tiles_json "$TILES_JSON"
+  --masks_dir "$STARDIST_MASKS_DIR"
+  --out_csv "$RAW_FEATURES_CSV"
+  --slide_id "$SLIDE_NAME"
+  --mpp "$MPP"
+  --diam_um "$NUC_DIAM_UM"
+  --batch_size "$BATCH_SIZE"
+  --dedup_radius_um "$DEDUP_RADIUS_UM"
+  --stardist_model "$STARDIST_MODEL"
+  --prob_thresh "$STARDIST_PROB"
+  --nms_thresh "$STARDIST_NMS"
+)
+python3 "$SRC_DIR/03_segment_and_merge_stardist.py" "${SEG_ARGS[@]}"
+
+# 04 density + summary (unchanged)
+echo "==> [04] Density + summary"
+python3 "$SRC_DIR/04_density.py" \
+  --input_csv "$RAW_FEATURES_CSV" --output_csv "$DENSITY_CSV" \
+  --mpp "$MPP" --radii_um "${RADII_ARR[@]}" \
+  --tissue_mask "$TISSUE_MASK_PATH" --mask_level 2 \
+  --downsamples "${DOWNS_ARR[@]}" \
+  --thumb "$THUMB_PATH" --summary_json "$SUMMARY_JSON" \
+  --percentile_clip 2 98
+
+# 05 enrich + visualizations (unchanged)
+echo "==> [05] Enrich + visualize"
+python3 "$SRC_DIR/05_enrich_and_visualize_features.py" \
+  --input_csv "$DENSITY_CSV" --out_csv "$ENRICHED_FEATURES_CSV" \
+  --out_dir "$VIZ_DIR" --thumb "$THUMB_PATH" \
+  --radii_um "${RADII_ARR[@]}" --features circularity gray_mean
+
+# 06 QC (unchanged)
+echo "==> [06] QC"
+python3 "$SRC_DIR/06_qc_panel_and_summary.py" \
+  --input_csv "$ENRICHED_FEATURES_CSV" --output_dir "$QC_DIR" \
+  --thumb "$THUMB_PATH" --scale 1.0
+
+echo "✅ Finished $SLIDE_NAME"
+echo "📂 Outputs in: $SLIDE_OUT"
+
+
+
+===== run_pipeline.sh =====
+#!/bin/bash
+# Usage: ./run_pipeline.sh CD3-S25
+
+set -e  # stop on error
+
+if [ -z "$1" ]; then
+  echo "❌ Please provide a slide ID (e.g., ./run_pipeline.sh CD3-S25)"
+  exit 1
+fi
+
+SLIDE="$1"
+RAW="data/raw/${SLIDE}.svs"
+RESULTS="results/$SLIDE"
+
+MMP=0.262697
+MASK_LEVEL=2
+DOWNSAMPLES="1.0 4.0 16.0 64.0"
+RADII="50 100"
+FEATURES="circularity gray_mean"
+CROP_SIZE=1024
+
+echo "🔁 Running full pipeline 00 → 06 for $SLIDE..."
+
+# Step 00 — Quick preview
+python3 src/00_quick_preview_enhanced.py \
+  --raw "$RAW" \
+  --out_dir "$RESULTS/00_preview" \
+  --crop_size $CROP_SIZE
+
+# Step 01 — Tissue mask
+python3 src/01_tissue_mask.py \
+  --raw "$RAW" \
+  --out "$RESULTS/01_mask/tissue_mask.png" \
+  --level $MASK_LEVEL
+
+# Step 02 — Tile and stain normalization
+python3 src/02_tile_and_stain_norm.py \
+  --raw "$RAW" \
+  --tissue_mask "$RESULTS/01_mask/tissue_mask.png" \
+  --out_dir "$RESULTS/02_tiles" \
+  --tile_size $CROP_SIZE \
+  --overlap 128 \
+  --level 0
+
+# Step 03 — Segment with Cellpose
+python3 src/03_segment_and_merge_cellpose.py \
+  --tiles_dir "$RESULTS/02_tiles" \
+  --tiles_json "$RESULTS/02_tiles/tiles.json" \
+  --masks_dir "$RESULTS/03_segment/masks" \
+  --out_csv "$RESULTS/03_segment/nuclei_features.csv" \
+  --slide_id "$SLIDE" \
+  --mpp $MMP \
+  --diam_um 10 \
+  --dedup_radius_um 6 \
+  --gpu \
+  --batch_size 16
+
+# Step 04 — Density analysis
+python3 src/04_density.py \
+  --input_csv "$RESULTS/03_segment/nuclei_features.csv" \
+  --output_csv "$RESULTS/04_density/nuclei_with_density.csv" \
+  --mpp $MMP \
+  --radii_um $RADII \
+  --tissue_mask "$RESULTS/01_mask/tissue_mask.png" \
+  --mask_level $MASK_LEVEL \
+  --downsamples $DOWNSAMPLES \
+  --thumb "$RESULTS/00_preview/${SLIDE}_thumb.jpg" \
+  --summary_json "$RESULTS/04_density/density_summary.json"
+
+# Step 05 — Feature enrichment
+python3 src/05_enrich_and_visualize_features.py \
+  --input_csv "$RESULTS/04_density/nuclei_with_density.csv" \
+  --out_csv "$RESULTS/05_features/features_enriched.csv" \
+  --out_dir "$RESULTS/05_features" \
+  --thumb "$RESULTS/00_preview/${SLIDE}_thumb.jpg" \
+  --radii_um $RADII \
+  --features $FEATURES
+
+# Step 06 — QC Panel
+python3 src/06_qc_panel_and_summary.py \
+  --input_csv "$RESULTS/05_features/features_enriched.csv" \
+  --output_dir "$RESULTS/06_qc" \
+  --thumb "$RESULTS/00_preview/${SLIDE}_thumb.jpg" \
+  --scale 1.0
+
+echo "🎉 Completed pipeline 00 → 06 for $SLIDE"
+
+
+
+===== setup_and_run.sh =====
+#!/bin/bash
+
+# === Configuration ===
+ENV_NAME="venv"
+REQUIREMENTS_FILE="requirements.txt"
+SLIDE="CD3-S25"
+RAW_SLIDE="data/raw/${SLIDE}.svs"
+PREVIEW_DIR="results/${SLIDE}/00_preview"
+SCRIPT_PATH="src/00_quick_preview_enhanced.py"
+
+echo "🚀 Setting up virtual environment..."
+
+# === Create virtual environment ===
+python3 -m venv $ENV_NAME
+source $ENV_NAME/bin/activate
+
+echo "✅ Virtual environment activated: $ENV_NAME"
+
+# === Install requirements ===
+if [ -f "$REQUIREMENTS_FILE" ]; then
+    echo "📦 Installing from $REQUIREMENTS_FILE..."
+    pip install -r "$REQUIREMENTS_FILE"
+else
+    echo "⚠️ No requirements.txt found — using inline packages..."
+    pip install numpy pandas matplotlib tqdm opencv-python-headless Pillow openslide-python scikit-image scipy cellpose
+fi
+
+# === Verify raw slide exists ===
+if [ ! -f "$RAW_SLIDE" ]; then
+    echo "❌ Slide file not found: $RAW_SLIDE"
+    echo "Please make sure the slide is available before running."
+    exit 1
+fi
+
+# === Run preview generation ===
+echo "🖼️ Generating preview for: $SLIDE"
+python3 "$SCRIPT_PATH" \
+  --raw "$RAW_SLIDE" \
+  --out_dir "$PREVIEW_DIR" \
+  --crop_size 1024
+
+echo "✅ Preview complete. Check output in: $PREVIEW_DIR"
+
+
+
+===== test_coherency_synthetic_FIXED.py =====
+#!/usr/bin/env python3
+"""
+Test coherency with REAL orientation angles in synthetic data
+"""
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import sys
+sys.path.insert(0, 'src')
+
+def create_aligned_nuclei(n=100, base_angle=0):
+    """All nuclei aligned in same direction"""
+    np.random.seed(42)
+    df = pd.DataFrame({
+        'x_um': np.random.rand(n) * 1000,
+        'y_um': np.random.rand(n) * 1000,
+        'major_axis_length': np.random.rand(n) * 20 + 10,
+        'minor_axis_length': np.random.rand(n) * 10 + 5,
+        'orientation': np.ones(n) * base_angle + np.random.randn(n) * 0.05  # All same angle ± noise
+    })
+    return df
+
+def create_random_nuclei(n=100):
+    """Random orientations"""
+    np.random.seed(43)
+    df = pd.DataFrame({
+        'x_um': np.random.rand(n) * 1000,
+        'y_um': np.random.rand(n) * 1000,
+        'major_axis_length': np.random.rand(n) * 20 + 10,
+        'minor_axis_length': np.random.rand(n) * 10 + 5,
+        'orientation': np.random.rand(n) * 2 * np.pi - np.pi  # Uniform random angles
+    })
+    return df
+
+def create_two_groups(n=100):
+    """Two groups with orthogonal orientations"""
+    np.random.seed(44)
+    n_half = n // 2
+    
+    # Group 1: horizontal (0 radians)
+    g1 = pd.DataFrame({
+        'x_um': np.random.rand(n_half) * 500,
+        'y_um': np.random.rand(n_half) * 1000,
+        'major_axis_length': np.ones(n_half) * 20,
+        'minor_axis_length': np.ones(n_half) * 10,
+        'orientation': np.zeros(n_half) + np.random.randn(n_half) * 0.1
+    })
+    
+    # Group 2: vertical (π/2 radians)
+    g2 = pd.DataFrame({
+        'x_um': np.random.rand(n_half) * 500 + 500,
+        'y_um': np.random.rand(n_half) * 1000,
+        'major_axis_length': np.ones(n_half) * 20,
+        'minor_axis_length': np.ones(n_half) * 10,
+        'orientation': np.ones(n_half) * np.pi/2 + np.random.randn(n_half) * 0.1
+    })
+    
+    return pd.concat([g1, g2], ignore_index=True)
+
+def compute_coherency_FIXED(df, radius_um):
+    """FIXED version using actual orientation"""
+    from scipy.spatial import cKDTree
+    
+    coords = np.vstack([df["x_um"], df["y_um"]]).T
+    tree = cKDTree(coords)
+    
+    # USE ACTUAL ORIENTATION
+    angles = df['orientation'].to_numpy()
+    
+    coherency = []
+    for i, p in enumerate(coords):
+        idx = tree.query_ball_point(p, radius_um)
+        
+        if len(idx) < 3:
+            coherency.append(0.0)
+            continue
+        
+        local_angles = angles[idx]
+        
+        # Structure tensor
+        Jxx = np.mean(np.cos(local_angles)**2)
+        Jyy = np.mean(np.sin(local_angles)**2)
+        Jxy = np.mean(np.cos(local_angles) * np.sin(local_angles))
+        
+        trace = Jxx + Jyy
+        det = Jxx * Jyy - Jxy**2
+        
+        discriminant = trace**2 - 4*det
+        if discriminant < 0:
+            discriminant = 0
+        
+        lambda1 = 0.5 * (trace + np.sqrt(discriminant))
+        lambda2 = 0.5 * (trace - np.sqrt(discriminant))
+        
+        if lambda1 + lambda2 > 1e-10:
+            coh = (lambda1 - lambda2) / (lambda1 + lambda2)
+        else:
+            coh = 0.0
+        
+        coherency.append(coh)
+    
+    return np.array(coherency)
+
+def plot_test_case(df, title, coherency_vals):
+    """Visualize with orientation vectors"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Left: orientation vectors using ACTUAL orientation
+    for idx, row in df.iterrows():
+        angle = row['orientation']
+        length = row['major_axis_length']
+        dx = length * np.cos(angle)
+        dy = length * np.sin(angle)
+        ax1.arrow(row['x_um'], row['y_um'], dx, dy,
+                 head_width=5, head_length=8, fc='blue', ec='blue', alpha=0.6)
+    ax1.set_xlim(0, 1000)
+    ax1.set_ylim(0, 1000)
+    ax1.set_aspect('equal')
+    ax1.set_title(f'{title}\nOrientation Vectors')
+    
+    # Right: coherency values
+    sc = ax2.scatter(df['x_um'], df['y_um'], c=coherency_vals, 
+                    cmap='RdYlGn', vmin=0, vmax=1, s=50)
+    ax2.set_xlim(0, 1000)
+    ax2.set_ylim(0, 1000)
+    ax2.set_aspect('equal')
+    ax2.set_title(f'Coherency\nMean: {np.mean(coherency_vals):.3f} ± {np.std(coherency_vals):.3f}')
+    plt.colorbar(sc, ax=ax2)
+    
+    return fig
+
+if __name__ == "__main__":
+    radius = 200
+    
+    print("="*60)
+    print("FIXED COHERENCY VALIDATION (using real orientation)")
+    print("="*60)
+    
+    # Test 1
+    print("\nTest 1: Aligned (EXPECT: ~1.0)")
+    df_aligned = create_aligned_nuclei(n=100)
+    coh_aligned = compute_coherency_FIXED(df_aligned, radius)
+    print(f"  Result: {np.mean(coh_aligned):.3f} ± {np.std(coh_aligned):.3f}")
+    fig1 = plot_test_case(df_aligned, "Aligned", coh_aligned)
+    fig1.savefig('test_FIXED_aligned.png', dpi=150)
+    plt.close()
+    
+    # Test 2
+    print("\nTest 2: Random (EXPECT: ~0.2-0.3)")
+    df_random = create_random_nuclei(n=100)
+    coh_random = compute_coherency_FIXED(df_random, radius)
+    print(f"  Result: {np.mean(coh_random):.3f} ± {np.std(coh_random):.3f}")
+    fig2 = plot_test_case(df_random, "Random", coh_random)
+    fig2.savefig('test_FIXED_random.png', dpi=150)
+    plt.close()
+    
+    # Test 3
+    print("\nTest 3: Two orthogonal groups (EXPECT: varies)")
+    df_two = create_two_groups(n=100)
+    coh_two = compute_coherency_FIXED(df_two, radius)
+    print(f"  Overall: {np.mean(coh_two):.3f} ± {np.std(coh_two):.3f}")
+    print(f"  Left:  {np.mean(coh_two[:50]):.3f}")
+    print(f"  Right: {np.mean(coh_two[50:]):.3f}")
+    fig3 = plot_test_case(df_two, "Two Groups", coh_two)
+    fig3.savefig('test_FIXED_two_groups.png', dpi=150)
+    plt.close()
+    
+    print("\n" + "="*60)
+    print("RESULTS:")
+    print(f"Aligned:  {np.mean(coh_aligned):.3f} ✓" if np.mean(coh_aligned) > 0.95 else f"Aligned: {np.mean(coh_aligned):.3f} ✗")
+    print(f"Random:   {np.mean(coh_random):.3f} ✓" if np.mean(coh_random) < 0.4 else f"Random: {np.mean(coh_random):.3f} ✗")
+    print(f"Variance: {np.std(coh_two):.3f} ✓" if np.std(coh_two) > 0.1 else f"Variance: {np.std(coh_two):.3f} ✗")
+    print("\nImages: test_FIXED_*.png")
+
+
+
+===== test_new_features.py =====
+#!/usr/bin/env python3
+"""
+Quick test to verify new features are working.
+Run this on a sample CSV to check coherency and variance calculations.
+
+Usage: python test_new_features.py --csv /path/to/nuclei_features.csv
+"""
+
+import argparse
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+
+def test_coherency_function():
+    """Test coherency calculation on synthetic data"""
+    print("\n" + "="*60)
+    print("TEST 1: Coherency Calculation")
+    print("="*60)
+    
+    # Create synthetic data with known alignment
+    n = 100
+    
+    # Aligned nuclei (should give high coherency)
+    aligned_df = pd.DataFrame({
+        'x_um': np.linspace(0, 100, n),
+        'y_um': np.linspace(0, 100, n),
+        'major_axis_length': np.ones(n) * 20,
+        'minor_axis_length': np.ones(n) * 10,  # All elongated same direction
+    })
+    
+    # Random nuclei (should give low coherency)
+    random_df = pd.DataFrame({
+        'x_um': np.random.rand(n) * 100,
+        'y_um': np.random.rand(n) * 100,
+        'major_axis_length': np.random.rand(n) * 20 + 10,
+        'minor_axis_length': np.random.rand(n) * 10 + 5,
+    })
+    
+    # Import function
+    import sys
+    sys.path.insert(0, '.')
+    from pathlib import Path
+    
+    # Load the coherency function
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("enrich", "05_enrich_and_visualize_features.py")
+    enrich = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(enrich)
+    
+    aligned_coh = enrich.compute_coherency(aligned_df, 50.0)
+    random_coh = enrich.compute_coherency(random_df, 50.0)
+    
+    print(f"Aligned nuclei coherency: {np.mean(aligned_coh):.3f} (expect ~0.8-1.0)")
+    print(f"Random nuclei coherency: {np.mean(random_coh):.3f} (expect ~0.0-0.3)")
+    
+    if np.mean(aligned_coh) > 0.6 and np.mean(random_coh) < 0.4:
+        print("✅ Coherency test PASSED")
+        return True
+    else:
+        print("❌ Coherency test FAILED")
+        return False
+
+
+def test_variance_function():
+    """Test variance calculation"""
+    print("\n" + "="*60)
+    print("TEST 2: Variance Calculation")
+    print("="*60)
+    
+    # Create data with known variance
+    n = 50
+    
+    # Uniform area (low variance)
+    uniform_df = pd.DataFrame({
+        'x_um': np.random.rand(n) * 100,
+        'y_um': np.random.rand(n) * 100,
+        'area_px': np.ones(n) * 100,  # All same size
+    })
+    
+    # Variable area (high variance)
+    variable_df = pd.DataFrame({
+        'x_um': np.random.rand(n) * 100,
+        'y_um': np.random.rand(n) * 100,
+        'area_px': np.random.rand(n) * 200 + 50,  # Wide range
+    })
+    
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("enrich", "05_enrich_and_visualize_features.py")
+    enrich = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(enrich)
+    
+    _, uniform_var, _ = enrich.compute_local_stats(uniform_df, 'area_px', 50.0)
+    _, variable_var, _ = enrich.compute_local_stats(variable_df, 'area_px', 50.0)
+    
+    print(f"Uniform area variance: {np.mean(uniform_var):.3f} (expect ~0)")
+    print(f"Variable area variance: {np.mean(variable_var):.3f} (expect >100)")
+    
+    if np.mean(uniform_var) < 10 and np.mean(variable_var) > 100:
+        print("✅ Variance test PASSED")
+        return True
+    else:
+        print("❌ Variance test FAILED")
+        return False
+
+
+def check_csv_columns(csv_path):
+    """Check if CSV has new columns"""
+    print("\n" + "="*60)
+    print("TEST 3: CSV Column Check")
+    print("="*60)
+    
+    df = pd.read_csv(csv_path)
+    
+    print(f"Total columns: {len(df.columns)}")
+    print(f"Total nuclei: {len(df):,}")
+    
+    # Check for new columns
+    expected_new = [
+        'coherency_150um',
+        'area_px_local_variance_150um',
+        'aspect_ratio_local_variance_150um',
+        'circularity_local_variance_150um'
+    ]
+    
+    found = []
+    missing = []
+    
+    for col in expected_new:
+        if col in df.columns:
+            found.append(col)
+            print(f"  ✅ {col}")
+            print(f"     Mean: {df[col].mean():.4f}, Range: [{df[col].min():.4f}, {df[col].max():.4f}]")
+        else:
+            missing.append(col)
+            print(f"  ❌ {col} - MISSING")
+    
+    print(f"\nFound {len(found)}/{len(expected_new)} expected columns")
+    
+    if missing:
+        print(f"\n⚠️  Missing columns: {missing}")
+        print("Re-run the pipeline with updated scripts!")
+        return False
+    else:
+        print("\n✅ All expected columns present!")
+        return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Test new feature implementations")
+    parser.add_argument("--csv", help="Path to enriched features CSV (optional)")
+    parser.add_argument("--run_unit_tests", action="store_true", 
+                       help="Run unit tests on synthetic data")
+    args = parser.parse_args()
+    
+    results = []
+    
+    if args.run_unit_tests:
+        results.append(("Coherency Test", test_coherency_function()))
+        results.append(("Variance Test", test_variance_function()))
+    
+    if args.csv:
+        if Path(args.csv).exists():
+            results.append(("CSV Columns Check", check_csv_columns(args.csv)))
+        else:
+            print(f"Error: CSV not found: {args.csv}")
+    
+    if not args.run_unit_tests and not args.csv:
+        print("Usage:")
+        print("  python test_new_features.py --run_unit_tests")
+        print("  python test_new_features.py --csv /path/to/features.csv")
+        print("  python test_new_features.py --run_unit_tests --csv /path/to/features.csv")
+        return
+    
+    # Summary
+    if results:
+        print("\n" + "="*60)
+        print("TEST SUMMARY")
+        print("="*60)
+        for test_name, passed in results:
+            status = "✅ PASS" if passed else "❌ FAIL"
+            print(f"{test_name}: {status}")
+        
+        if all(r[1] for r in results):
+            print("\n🎉 All tests passed! Features are working correctly.")
+        else:
+            print("\n⚠️  Some tests failed. Check implementation.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== validate_coherency.py =====
+#!/usr/bin/env python3
+"""
+Validate coherency by visualizing orientation vectors
+"""
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from pathlib import Path
+
+def plot_orientation_field(df, thumb_path, out_path, 
+                           region=None, subsample=20, 
+                           arrow_scale=30):
+    """
+    Draw orientation vectors on tissue thumbnail
+    
+    region: (x_min, x_max, y_min, y_max) to zoom
+    subsample: show every Nth cell
+    arrow_scale: arrow length multiplier
+    """
+    img = np.array(Image.open(thumb_path).convert('RGB'))
+    fig, ax = plt.subplots(figsize=(16, 16))
+    ax.imshow(img)
+    
+    # Subsample to avoid clutter
+    df_sub = df.iloc[::subsample].copy()
+    
+    # Crop to region if specified
+    if region:
+        x_min, x_max, y_min, y_max = region
+        df_sub = df_sub[
+            (df_sub['x'] >= x_min) & (df_sub['x'] <= x_max) &
+            (df_sub['y'] >= y_min) & (df_sub['y'] <= y_max)
+        ]
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_max, y_min)  # Inverted y
+    
+    # Calculate angles from major/minor axis
+    angles = np.arctan2(df_sub['minor_axis_length'], 
+                       df_sub['major_axis_length'])
+    
+    # Draw arrows
+    for idx, row in df_sub.iterrows():
+        angle = angles[idx]
+        length = row['major_axis_length'] / 2 * arrow_scale
+        
+        dx = length * np.cos(angle)
+        dy = length * np.sin(angle)
+        
+        ax.arrow(row['x'], row['y'], dx, dy,
+                head_width=5, head_length=8,
+                fc='red', ec='red', alpha=0.7, linewidth=1)
+    
+    ax.set_title(f'Orientation Vectors (every {subsample}th nucleus)', 
+                fontsize=16)
+    ax.axis('off')
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
+def plot_local_average_angle(df, thumb_path, out_path, radius_um=150):
+    """
+    Show local average orientation as heatmap
+    """
+    from scipy.spatial import cKDTree
+    
+    coords = np.vstack([df['x_um'], df['y_um']]).T
+    tree = cKDTree(coords)
+    angles = np.arctan2(df['minor_axis_length'], df['major_axis_length'])
+    
+    local_avg_angles = []
+    for i, p in enumerate(coords):
+        idx = tree.query_ball_point(p, radius_um)
+        if len(idx) > 3:
+            # Circular mean for angles
+            local_angles = angles.iloc[idx] if hasattr(angles, 'iloc') else angles[idx]
+            avg_angle = np.arctan2(
+                np.mean(np.sin(local_angles)),
+                np.mean(np.cos(local_angles))
+            )
+        else:
+            avg_angle = angles.iloc[i] if hasattr(angles, 'iloc') else angles[i]
+        local_avg_angles.append(avg_angle)
+    
+    df['local_avg_angle'] = local_avg_angles
+    
+    # Plot
+    img = np.array(Image.open(thumb_path).convert('RGB'))
+    fig, ax = plt.subplots(figsize=(12, 12))
+    ax.imshow(img)
+    
+    sc = ax.scatter(df['x'], df['y'], 
+                   c=df['local_avg_angle'], 
+                   cmap='hsv', s=4, alpha=0.7,
+                   vmin=-np.pi, vmax=np.pi)
+    ax.set_title(f'Local Average Angle ({radius_um}µm)', fontsize=16)
+    ax.axis('off')
+    plt.colorbar(sc, label='Angle (radians)', shrink=0.5)
+    plt.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {out_path}")
+    
+    return df
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--csv", required=True)
+    ap.add_argument("--thumb", required=True)
+    ap.add_argument("--out_dir", required=True)
+    ap.add_argument("--slide_name", required=True)
+    args = ap.parse_args()
+    
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(args.csv)
+    
+    # Full slide orientation field
+    plot_orientation_field(
+        df, args.thumb,
+        Path(args.out_dir) / f"{args.slide_name}_orientation_vectors_full.png",
+        subsample=50
+    )
+    
+    # Zoomed regions (pick 3 interesting areas)
+    # You'll need to identify good regions - tumor boundary, uniform tissue, etc.
+    
+    # Local average angle heatmap
+    df = plot_local_average_angle(
+        df, args.thumb,
+        Path(args.out_dir) / f"{args.slide_name}_local_avg_angle.png"
+    )
+    
+    # Save updated CSV with local avg angle
+    df.to_csv(args.csv.replace('.csv', '_with_angles.csv'), index=False)
+
+
+
